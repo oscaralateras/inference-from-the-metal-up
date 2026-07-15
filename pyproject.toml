@@ -8,6 +8,9 @@ authors = [{ name = "Oscar Alateras" }]
 dependencies = [
     "numpy>=2.0",
     "matplotlib>=3.9",
+    "torch>=2.13.0",
+    "safetensors>=0.8.0",
+    "huggingface-hub>=1.23.0",
 ]
 
 [dependency-groups]
