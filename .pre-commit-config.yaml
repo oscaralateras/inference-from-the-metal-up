@@ -1,0 +1,21 @@
+# Local hooks via `uv run` so there are no external revs to pin/drift.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: pyright
+        name: pyright
+        entry: uv run pyright
+        language: system
+        pass_filenames: false

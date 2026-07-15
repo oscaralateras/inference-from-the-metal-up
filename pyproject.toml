@@ -1,0 +1,41 @@
+[project]
+name = "inference-arch-fundamentals"
+version = "0.1.0"
+description = "Computer architecture, metal to token — reproducible artefacts for understanding LLM inference from first principles."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Oscar Alateras" }]
+dependencies = [
+    "numpy>=2.0",
+    "matplotlib>=3.9",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "pyright>=1.1.380",
+    "pytest>=8.0",
+    "pre-commit>=3.8",
+]
+
+[tool.uv]
+# Not a distributable package — a repo of topic artefacts. uv just manages the venv + deps.
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pyright]
+include = ["topics", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

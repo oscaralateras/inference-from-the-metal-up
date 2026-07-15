@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.ruff_cache/
+.pytest_cache/
+.pyright/
+*.egg-info/
+
+# OS
+.DS_Store
+
+# Large model weights pulled at runtime (never commit these)
+*.safetensors
+*.bin
+*.pt
+*.gguf
