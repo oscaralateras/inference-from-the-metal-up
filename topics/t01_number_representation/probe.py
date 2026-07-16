@@ -8,7 +8,7 @@ fidelity two ways:
   - output fidelity : SQNR, relative error, and cosine of the layer output W @ x vs W_hat @ x on
     a random input x — the error inference actually experiences (weight error is only a proxy).
 
-`run_sweep` returns the results as a list of `Result` so the plotter can reuse them.
+`run_sweep` returns (results, weight) so the plotter can reuse both without re-loading.
 
     uv run python topics/t01_number_representation/probe.py
 """
@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from load_weights import load_linear_weight
-from metrics import cosine_similarity, relative_error, sqnr_db
+from metrics import FloatArray, cosine_similarity, relative_error, sqnr_db
 from quantise import Granularity, dequantise, quantise_symmetric
 
 BIT_WIDTHS = [8, 7, 6, 5, 4, 3, 2]
@@ -40,7 +40,7 @@ class Result:
     out_cos: float  # output direction
 
 
-def run_sweep() -> list[Result]:
+def run_sweep() -> tuple[list[Result], FloatArray]:
     w = load_linear_weight()  # real SmolLM2 gate_proj weight, float32
     in_features = w.shape[1]
 
@@ -77,7 +77,7 @@ def run_sweep() -> list[Result]:
             f"{r.n_bits:>6} {r.granularity:>12} {r.w_sqnr:>8.2f} "
             f"{r.out_sqnr:>9.2f} {r.out_relerr * 100:>9.2f} {r.out_cos:>9.5f}"
         )
-    return results
+    return results, w
 
 
 if __name__ == "__main__":

@@ -35,6 +35,8 @@ def sqnr_db(reference: FloatArray, approx: FloatArray) -> float:
     noise_power = float(np.mean((reference - approx) ** 2))
     if noise_power == 0.0:
         return float("inf")  # perfect reconstruction — no noise
+    if signal_power == 0.0:
+        return float("-inf")  # no signal, only error
     return 10.0 * float(np.log10(signal_power / noise_power))
 
 
