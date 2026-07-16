@@ -9,7 +9,7 @@ Part of a three-repo learning portfolio: this repo explains *why* inference perf
 
 | # | Topic | Headline finding | Inference payoff |
 |---|-------|------------------|------------------|
-| T1 | Number representation / quantization | _in progress_ | |
+| T1 | Number representation / quantization | Granularity is decisive at low bit-width: naive per-tensor int4 gives 71% output error (cos 0.79); per-group holds 11% (cos 0.99) — worth ~2–3 bits. | Why production int4 needs per-group scales + why GPTQ/AWQ exist: one outlier channel dominates a single per-tensor scale. |
 
 *(Rows fill in as each artefact ships — this table is the 30-second view of the whole repo.)*
 
