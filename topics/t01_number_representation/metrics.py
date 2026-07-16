@@ -1,14 +1,19 @@
 """Gold-standard error metrics for the quantisation experiment.
 
-Two generic metrics, each comparing a `reference` array against an `approx` of the same shape:
+Three generic metrics, each comparing a `reference` array against an `approx` of the same shape.
+There are only two independent axes here — error *magnitude* and error *direction* — so:
 
-  - sqnr_db          : signal-to-quantisation-noise ratio in dB (the standard fidelity number).
-  - cosine_similarity: 1.0 = identical direction (does the vector still point the same way).
+  - sqnr_db          : magnitude, in dB (the field-standard fidelity number; good for plots).
+  - relative_error   : magnitude, as a fraction (the human-readable form; 0.11 => "~11% off").
+  - cosine_similarity: direction (1.0 = the vector still points the same way).
+
+sqnr_db and relative_error are the same axis in two units (relerr = 10 ** (-sqnr_db / 20)); both
+are reported because one is standard and one is intuitive. Raw MSE was dropped: it's that same
+magnitude axis but scale-dependent (not comparable across tensors), and max-abs was a misleading
+worst-case number dominated by a single outlier.
 
 They are applied to BOTH the weights (weight fidelity) and the layer output W @ x (output
-fidelity — what inference actually experiences). Raw MSE and max-abs-error were dropped: MSE is
-just the un-normalised SQNR numerator (redundant), and max-abs is a misleading worst-case number
-dominated by a single outlier.
+fidelity — what inference actually experiences).
 """
 
 from __future__ import annotations
@@ -33,6 +38,20 @@ def sqnr_db(reference: FloatArray, approx: FloatArray) -> float:
     return 10.0 * float(np.log10(signal_power / noise_power))
 
 
+def relative_error(reference: FloatArray, approx: FloatArray) -> float:
+    """Relative L2 error: ||reference - approx|| / ||reference||. Lower is better.
+
+    Reads directly as "what fraction of the signal is error" (x100 for a percentage;
+    0.11 => the output is ~11% off). Same magnitude axis as sqnr_db, in human units.
+    """
+    ref = reference.reshape(-1)
+    err = (reference - approx).reshape(-1)
+    denom = float(np.linalg.norm(ref))
+    if denom == 0.0:
+        return 0.0  # a zero reference has no signal to be wrong about
+    return float(np.linalg.norm(err) / denom)
+
+
 def cosine_similarity(a: FloatArray, b: FloatArray) -> float:
     """Cosine similarity of the flattened arrays. 1.0 = identical direction.
 
@@ -49,9 +68,13 @@ def cosine_similarity(a: FloatArray, b: FloatArray) -> float:
 
 def _selftest() -> None:
     a = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    print("identical :", f"sqnr={sqnr_db(a, a)}  cosine={cosine_similarity(a, a):.5f}")
+    print("identical :", f"sqnr={sqnr_db(a, a)}  relerr={relative_error(a, a):.4f}")
     b = np.array([1.1, 1.9, 3.0], dtype=np.float32)
-    print("perturbed :", f"sqnr={sqnr_db(a, b):.2f}dB  cosine={cosine_similarity(a, b):.5f}")
+    print(
+        "perturbed :",
+        f"sqnr={sqnr_db(a, b):.2f}dB  relerr={relative_error(a, b):.4f}  "
+        f"cosine={cosine_similarity(a, b):.5f}",
+    )
 
 
 if __name__ == "__main__":
