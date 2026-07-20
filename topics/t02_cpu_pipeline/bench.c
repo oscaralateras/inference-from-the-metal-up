@@ -79,13 +79,21 @@ static int cmp_int(const void *a, const void *b) {
  * which forbids the optimiser from deleting the loop as dead code. This return value
  * is our "sink".
  *
- * The `if` on the next-to-last line is THE branch this whole artefact is about. */
+ * The `if` on the next-to-last line is THE branch this whole artefact is about — so we
+ * must stop the compiler from ERASING it. At -O2 on GCC/x86 it will happily "if-convert"
+ * this into a branchless conditional-move (cmov): compute both outcomes, select one, no
+ * jump. Then there is no branch to mispredict and sorted == unsorted (exactly the null
+ * result we first saw on x86). The clobber() barrier inside the taken path fixes this:
+ * a side-effecting barrier can't be run unconditionally, so the compiler is forced to
+ * keep a real, data-dependent branch (and can't vectorise the loop either). It emits no
+ * instructions, so the runtime cost we measure is genuinely the branch's. */
 __attribute__((noinline))
 static long long sum_above_threshold(const int *data, int n) {
     long long sum = 0;
     for (int i = 0; i < n; i++) {
         if (data[i] >= THRESHOLD) {   /* <-- predictable when sorted, coin-flip when not */
             sum += data[i];
+            clobber();                /* keep this a REAL branch (block cmov / vectorisation) */
         }
     }
     return sum;
