@@ -1,0 +1,7 @@
+experiment,variant,n,ns_per_elem,checksum
+branch,unsorted,32768,0.8309,3149316000
+branch,sorted,32768,0.4718,3149316000
+ilp,dependent,100000000,1.6509,9999546
+ilp,independent,100000000,0.5156,57079619
+simd,scalar,4096,0.3255,204754080
+simd,vector,4096,0.1383,204754080

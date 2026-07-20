@@ -73,14 +73,14 @@ def load() -> dict[tuple[str, str], float]:
 
 def _label_bars(ax: Axes, xs: list[float], values: list[float]) -> None:
     """Direct value label above each bar (3 significant figures)."""
-    for x, v in zip(xs, values):
+    for x, v in zip(xs, values, strict=True):
         ax.text(x, v, f"{v:.3g}", ha="center", va="bottom", fontsize=9, color="0.2")
 
 
 def plot_costs(data: dict[tuple[str, str], float]) -> Path:
     """Three panels — hostile vs friendly variant per experiment, ns per operation."""
     fig, axes = plt.subplots(1, 3, figsize=(11, 4.3))
-    for ax, (exp, hostile, friendly, title) in zip(axes, EXPERIMENTS):
+    for ax, (exp, hostile, friendly, title) in zip(axes, EXPERIMENTS, strict=True):
         vals = [data[(exp, hostile)], data[(exp, friendly)]]
         ax.bar([0, 1], vals, width=0.62, color=[C_HOSTILE, C_FRIENDLY], zorder=3)
         _label_bars(ax, [0, 1], vals)
@@ -120,7 +120,7 @@ def plot_speedups(data: dict[tuple[str, str], float]) -> Path:
     ax.axvline(1.0, color="0.5", linewidth=1.2, linestyle="--", zorder=2)  # 1x = no gain
     ax.text(1.0, len(titles) - 0.5, "1× (no gain)", color="0.4", fontsize=9, va="center")
 
-    for y, s in zip(ys, speedups):
+    for y, s in zip(ys, speedups, strict=True):
         ax.text(s, y, f"  {s:.1f}×", va="center", ha="left", fontsize=12, fontweight="bold")
 
     ax.set_yticks(ys)
