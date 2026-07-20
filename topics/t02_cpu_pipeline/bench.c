@@ -33,6 +33,12 @@
  *       mutes this effect and has a different branch predictor.
  */
 
+/* Ask glibc to expose POSIX clock_gettime / CLOCK_MONOTONIC. Needed on Linux because
+ * -std=c11 is strict ISO C, which hides POSIX extensions unless we request them. Must be
+ * defined before any header is included. (macOS exposes them regardless, so this is a
+ * no-op there.) */
+#define _POSIX_C_SOURCE 199309L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
