@@ -6,6 +6,17 @@ principles, the **outlier problem** that forces per-channel/per-group quantizati
 
 **Status:** complete.
 
+## Reproduce
+
+```bash
+uv sync                                                    # once, from the repo root (Python 3.12)
+uv run python topics/t01_number_representation/probe.py    # prints the results table
+uv run python topics/t01_number_representation/plot.py     # writes results/*.png
+uv run pytest topics/t01_number_representation             # 8 unit tests
+```
+
+CPU-only (no GPU); runs in seconds. Weights are pulled from Hugging Face on first run.
+
 ---
 
 ## Lab note
@@ -14,6 +25,12 @@ principles, the **outlier problem** that forces per-channel/per-group quantizati
 vs per-channel vs per-group), and where do weight outliers break it?
 
 **Setup.**
+
+*In plain terms:* we take one real weight matrix from a small LLM and squash its numbers from 32-bit
+floats down to as few as 2-bit integers — several ways, coarse to fine — then measure how badly the
+layer's output degrades. The goal is to find *where* the naive method breaks and *why* (spoiler: one
+outlier weight ruins the scale for all the others).
+
 - **Tensor:** `model.layers.0.mlp.gate_proj.weight` from `HuggingFaceTB/SmolLM2-135M`, shape
   `(1536, 576)`, read straight from safetensors as float32. `max|w| = 3.25` vs `mean|w| = 0.15` — a
   ~22× outlier that turns out to be the whole story.
