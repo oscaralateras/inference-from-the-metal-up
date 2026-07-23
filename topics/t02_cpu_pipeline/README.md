@@ -7,6 +7,19 @@ back to why latency-bound, one-token-at-a-time inference is slow on hardware bui
 
 **Status:** complete.
 
+## Reproduce
+
+```bash
+cd topics/t02_cpu_pipeline
+make run                # builds bench.c → results/pipeline.csv (+ prints a summary to stderr)
+uv run python plot.py   # writes results/pipeline_costs.png + pipeline_speedups.png
+uv run pytest .         # directional integration checks (effect direction + checksum invariant)
+```
+
+Runs on any machine, but the **canonical numbers in this note are from Linux x86** — on Apple
+Silicon the branch and SIMD effects are muted (see *Setup*). `make run` fails loudly if the
+sorted/unsorted checksums ever diverge.
+
 ---
 
 ## Lab note

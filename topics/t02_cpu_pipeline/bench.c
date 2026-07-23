@@ -383,6 +383,10 @@ int main(void) {
     fprintf(stderr, "  speedup  : %.2fx faster when sorted\n", ns_unsorted / ns_sorted);
     fprintf(stderr, "  checksum : %lld (must match: %s)\n",
             checksum_sorted, checksum_sorted == checksum_unsorted ? "OK" : "MISMATCH!");
+    if (checksum_sorted != checksum_unsorted) {
+        fprintf(stderr, "FATAL: sorted and unsorted sums differ — the branch benchmark is broken.\n");
+        return 1;  /* fail loudly: a broken invariant must not pass silently */
+    }
 
     fprintf(stderr, "\ninstruction-level parallelism (ns per multiply-add):\n");
     fprintf(stderr, "  dependent  (1 chain)    : %.3f ns/op\n", ns_dependent);
