@@ -11,6 +11,9 @@ __pycache__/
 bench
 *.o
 
+# Rust build artifacts (Cargo.lock IS committed for the binary; target/ is not)
+target/
+
 # OS
 .DS_Store
 

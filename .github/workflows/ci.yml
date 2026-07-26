@@ -25,3 +25,19 @@ jobs:
         run: uv run pyright
       - name: Test
         run: uv run pytest
+
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: topics/t04_concurrency
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add rustfmt + clippy
+        run: rustup component add rustfmt clippy
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+      - name: Test
+        run: cargo test

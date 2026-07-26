@@ -1,0 +1,14 @@
+[package]
+name = "t04_concurrency"
+version = "0.1.0"
+edition = "2021"
+
+# From-scratch: standard library only — std::thread, std::sync::atomic, std::sync::Mutex.
+# No external crates, so the concurrency primitives are the ones we're actually studying.
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
