@@ -85,6 +85,12 @@ class TransformerBlock:
     def weight_bytes(self) -> int:
         return self.n_params() * self.q.element_size()
 
+    def to_device(self, device: torch.device) -> TransformerBlock:
+        """Move every tensor to `device`. Returns self so it can be chained onto a loader."""
+        for name in ("q", "k", "v", "o", "gate", "up", "down", "attn_norm", "mlp_norm"):
+            setattr(self, name, getattr(self, name).to(device))
+        return self
+
     # ---- forward -------------------------------------------------------------------------
 
     def attention(self, x: torch.Tensor, kv_source: torch.Tensor | None = None) -> torch.Tensor:
