@@ -1,6 +1,6 @@
 # T1 — Number representation / floating point / quantization foundation
 
-**Artefact (a01):** a symmetric integer quantizer built from scratch, used to measure **quantization
+**What this is:** a symmetric integer quantizer built from scratch, used to measure **quantization
 error vs. bit-width and granularity** on a real LLM weight tensor — reproducing, from first
 principles, the **outlier problem** that forces per-channel/per-group quantization.
 

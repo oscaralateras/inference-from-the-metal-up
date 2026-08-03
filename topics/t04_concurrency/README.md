@@ -1,6 +1,6 @@
 # T4 — Concurrency & synchronization
 
-**Artefact (a04):** a from-scratch **Rust** microbenchmark measuring **what caps the throughput of a
+**What this is:** a from-scratch **Rust** microbenchmark measuring **what caps the throughput of a
 concurrent inference server** — the coordination taxes on the shared state a token-serving loop lives
 on. Four experiments, each cast as a real serving component:
 1. **False sharing** (per-worker token counters) — N request-workers each tally their *own* token
@@ -29,7 +29,7 @@ cd topics/t04_concurrency
 make run                # cargo build --release + run → results/concurrency.csv (+ stderr summary)
 make check              # cargo fmt --check + clippy -D warnings
 make test               # cargo test (correctness invariants)
-uv run python plot.py   # writes results/*.png   (once plot.py covers all four)
+uv run python plot.py   # writes results/*.png   (all four experiments)
 uv run pytest .         # directional integration checks
 ```
 

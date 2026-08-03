@@ -1,6 +1,6 @@
 # T2 — CPU execution and the pipeline
 
-**Artefact (a02):** a from-scratch C microbenchmark that isolates and measures three things a modern
+**What this is:** a from-scratch C microbenchmark that isolates and measures three things a modern
 CPU does to go fast — **branch prediction**, **instruction-level parallelism (ILP)**, and **SIMD** —
 by running *identical work* two ways and changing only how well it fits the pipeline. Each result ties
 back to why latency-bound, one-token-at-a-time inference is slow on hardware built for throughput.

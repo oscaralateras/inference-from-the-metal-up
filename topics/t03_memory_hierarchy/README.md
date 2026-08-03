@@ -1,6 +1,6 @@
 # T3 — Memory hierarchy & the memory-vs-compute wall
 
-**Artefact (a03):** three from-scratch microbenchmarks that measure **why LLM decode is
+**What this is:** three from-scratch microbenchmarks that measure **why LLM decode is
 memory-bandwidth-bound — and what makes it fast**. Written in C and run on a Linux x86 box, with a
 small PyTorch companion on a GPU:
 1. **Bandwidth hierarchy** — how fast the machine can *stream* data as the working set grows past
