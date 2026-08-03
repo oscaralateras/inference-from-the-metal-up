@@ -99,11 +99,13 @@ def step_dp(
     for _ in range(layers):
         local = block.forward(local)
 
-    gathered = [torch.empty_like(local) for _ in range(world)] if rank == 0 else None
-    dist.gather(local, gathered, dst=0)
-    # The gather exists only so the test can reconstruct the full output; a real DP server never
-    # does it (each rank returns its own requests). It is excluded from the comms accounting.
-    return (torch.cat(gathered, dim=0) if rank == 0 and gathered else None), 0
+    # all_gather rather than gather: NCCL does not implement gather, and this harness must run
+    # unchanged on both backends. The reassembly exists only so the correctness check can compare
+    # against the unsharded forward — a real DP server never does it (each rank returns its own
+    # requests) — so it is excluded from the comms accounting below.
+    gathered = [torch.empty_like(local) for _ in range(world)]
+    dist.all_gather(gathered, local.contiguous())
+    return (torch.cat(gathered, dim=0) if rank == 0 else None), 0
 
 
 def step_tp(
@@ -207,9 +209,10 @@ def step_sp(
         h = local + attn
         local = h + block.mlp(rms_norm(h, block.mlp_norm))  # per-token, no comms
 
-    gathered = [torch.empty_like(local) for _ in range(world)] if rank == 0 else None
-    dist.gather(local.contiguous(), gathered, dst=0)
-    return (torch.cat(gathered, dim=1) if rank == 0 and gathered else None), comms
+    # all_gather, not gather: NCCL has no gather. Reassembly is for the correctness check only.
+    gathered = [torch.empty_like(local) for _ in range(world)]
+    dist.all_gather(gathered, local.contiguous())
+    return (torch.cat(gathered, dim=1) if rank == 0 else None), comms
 
 
 def step_ep(

@@ -20,19 +20,20 @@ FIELDS = ("experiment", "variant", "workers", "metric", "value")
 
 
 def append_rows(rows: list[dict[str, object]]) -> None:
-    """Replace any existing rows for the experiments present in `rows`, then append these.
+    """Replace existing rows matching the (experiment, variant) pairs in `rows`, then append these.
 
-    Replace-by-experiment (rather than plain append) keeps the file idempotent: re-running one
-    experiment refreshes its own rows and leaves the other two untouched, so a partial re-run
-    can never silently produce a CSV holding two different runs of the same experiment.
+    Idempotent so a re-run refreshes its own numbers rather than stacking a second run on top of
+    the first. The replace key is the **(experiment, variant) pair**, not the experiment alone:
+    keying on experiment meant that re-running one strategy — say `--strategies ep` — silently
+    deleted every other strategy's rows from the same experiment, losing data with no error.
     """
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    incoming = {str(r["experiment"]) for r in rows}
+    incoming = {(str(r["experiment"]), str(r["variant"])) for r in rows}
 
     kept: list[dict[str, str]] = []
     if CSV_PATH.exists():
         with CSV_PATH.open() as f:
-            kept = [r for r in csv.DictReader(f) if r["experiment"] not in incoming]
+            kept = [r for r in csv.DictReader(f) if (r["experiment"], r["variant"]) not in incoming]
 
     with CSV_PATH.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
@@ -42,7 +43,12 @@ def append_rows(rows: list[dict[str, object]]) -> None:
         for row in rows:
             writer.writerow({k: row[k] for k in FIELDS})
 
-    print(f"\nwrote {len(rows)} rows for {sorted(incoming)} -> {CSV_PATH.relative_to(Path.cwd())}")
+    experiments = sorted({e for e, _ in incoming})
+    try:
+        shown = CSV_PATH.relative_to(Path.cwd())
+    except ValueError:  # CSV lives outside cwd (e.g. a tmp dir under test)
+        shown = CSV_PATH
+    print(f"\nwrote {len(rows)} rows for {experiments} -> {shown}")
 
 
 def read_rows(experiment: str | None = None) -> list[dict[str, str]]:

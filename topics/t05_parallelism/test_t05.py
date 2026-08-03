@@ -259,3 +259,39 @@ def test_attention_is_causal(block):
 def test_head_dim_consistency(block):
     assert block.n_heads * block.head_dim == block.hidden
     assert math.isclose(block.hidden / block.n_heads, block.head_dim)
+
+
+def test_partial_rerun_does_not_delete_other_variants(tmp_path, monkeypatch):
+    """A re-run of ONE variant must not wipe its siblings.
+
+    Regression test: the replace key was the experiment alone, so re-running a single strategy
+    silently deleted every other strategy's rows from the same experiment — data loss with no
+    error and no warning.
+    """
+    import results_io
+
+    monkeypatch.setattr(results_io, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(results_io, "CSV_PATH", tmp_path / "parallelism.csv")
+
+    base = [
+        {"experiment": "strategies_gloo", "variant": v, "workers": 2, "metric": "m", "value": "1"}
+        for v in ("dp", "tp", "ep")
+    ]
+    results_io.append_rows(base)
+    assert {r["variant"] for r in results_io.read_rows("strategies_gloo")} == {"dp", "tp", "ep"}
+
+    # Re-run only `ep`, with a new value.
+    results_io.append_rows(
+        [
+            {
+                "experiment": "strategies_gloo",
+                "variant": "ep",
+                "workers": 2,
+                "metric": "m",
+                "value": "9",
+            }
+        ]
+    )
+    rows = results_io.read_rows("strategies_gloo")
+    assert {r["variant"] for r in rows} == {"dp", "tp", "ep"}, "siblings were deleted"
+    assert [r["value"] for r in rows if r["variant"] == "ep"] == ["9"], "ep was not refreshed"
