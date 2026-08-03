@@ -380,7 +380,7 @@ wheels = [
 ]
 
 [[package]]
-name = "inference-arch-fundamentals"
+name = "inference-from-the-metal-up"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

@@ -1,5 +1,5 @@
 [project]
-name = "inference-arch-fundamentals"
+name = "inference-from-the-metal-up"
 version = "0.1.0"
 description = "Computer architecture, metal to token — reproducible artefacts for understanding LLM inference from first principles."
 readme = "README.md"
