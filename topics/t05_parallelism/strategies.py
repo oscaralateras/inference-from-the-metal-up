@@ -290,6 +290,8 @@ def _worker(rank: int, world: int, cfg: dict, out_path: str) -> None:
             return step_sp(block, x, rank, world, layers)
         return step_ep(moe, x, assignment, rank, world)
 
+    out: torch.Tensor | None = None
+    comms = 0
     with torch.no_grad():
         for _ in range(WARMUP_STEPS):
             one_step()
@@ -356,7 +358,9 @@ def run(strategy: str, world: int, cfg: dict) -> Result:
     full = {**cfg, "strategy": strategy}
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
         out_path = f.name
-    mp.spawn(_worker, args=(world, full, out_path), nprocs=world, join=True)
+    mp.spawn(  # pyright: ignore[reportPrivateImportUsage]
+        _worker, args=(world, full, out_path), nprocs=world, join=True
+    )
     return Result(**json.loads(Path(out_path).read_text()))
 
 

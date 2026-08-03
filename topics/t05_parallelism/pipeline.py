@@ -38,9 +38,9 @@ N_STAGES = 4
 # LAYERS_PER_STAGE consecutive layers, exactly as PP partitions a real model by depth.
 LAYERS_PER_STAGE = 6
 
-# Tokens per microbatch. Small on purpose: this is the decode regime, where microbatches are
-# small by construction (T3) — which is precisely why the bubble bites.
-TOKENS_PER_MICROBATCH = 32
+# One microbatch is one sequence of this length. Small on purpose: this is the decode regime,
+# where microbatches are small by construction (T3) — precisely why the bubble bites.
+SEQ_PER_MICROBATCH = 64
 
 # Microbatch counts to sweep. Spans the regime where the bubble dominates (M < P) through to
 # where it is nearly amortised (M >> P).
@@ -127,7 +127,7 @@ def run_pipeline(
         t.start()
 
     inputs = [
-        torch.randn(TOKENS_PER_MICROBATCH, block.hidden, generator=torch.Generator().manual_seed(m))
+        torch.randn(1, SEQ_PER_MICROBATCH, block.hidden, generator=torch.Generator().manual_seed(m))
         for m in range(microbatches)
     ]
 
@@ -151,7 +151,7 @@ def run_pipeline(
 def calibrate_stage_seconds(block: TransformerBlock, n_layers: int, reps: int = 15) -> float:
     """Median seconds for one stage's layers on one microbatch, measured solo on one thread."""
     h0 = torch.randn(
-        TOKENS_PER_MICROBATCH, block.hidden, generator=torch.Generator().manual_seed(7)
+        1, SEQ_PER_MICROBATCH, block.hidden, generator=torch.Generator().manual_seed(7)
     )
     for _ in range(3):  # warm-up
         h = h0
@@ -191,8 +191,8 @@ def _main() -> None:
     layer_s = calibrate_stage_seconds(block, 1)
     stage_ms = layer_s * LAYERS_PER_STAGE * 1e3
     print(
-        f"{N_STAGES} stages x {LAYERS_PER_STAGE} SmolLM2 MLP layers, "
-        f"{TOKENS_PER_MICROBATCH} tokens/microbatch"
+        f"{N_STAGES} stages x {LAYERS_PER_STAGE} transformer layers, "
+        f"{SEQ_PER_MICROBATCH} tokens/microbatch"
     )
     print(f"one layer: {layer_s * 1e3:.2f} ms  ->  ~{stage_ms:.1f} ms per stage")
     print("pinned to 1 torch thread\n")
