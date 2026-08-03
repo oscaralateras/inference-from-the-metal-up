@@ -41,7 +41,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from model import TransformerBlock, load_block, random_block, rms_norm
+from model import MODEL_ID, TransformerBlock, load_block, random_block, rms_norm
 from moe import build_moe, load_factor, route
 
 STRATEGIES = ("dp", "tp", "pp", "sp", "ep")
@@ -259,7 +259,9 @@ def _worker(rank: int, world: int, cfg: dict, out_path: str) -> None:
     else:
         torch.set_num_threads(max(1, cfg["threads_per_rank"]))
 
-    block = (random_block() if cfg["random_weights"] else load_block(0)).to_device(device)
+    block = (random_block() if cfg["random_weights"] else load_block(0, cfg["model"])).to_device(
+        device
+    )
     batch, seq, layers = cfg["batch"], cfg["seq"], cfg["layers"]
     tokens = batch * seq
     x = torch.randn(
@@ -378,6 +380,12 @@ def _main() -> None:
     parser.add_argument("--microbatches", type=int, default=DEFAULT_MICROBATCHES)
     parser.add_argument("--routing", choices=("uniform", "skewed"), default="uniform")
     parser.add_argument("--random-weights", action="store_true")
+    parser.add_argument(
+        "--model",
+        default=MODEL_ID,
+        help="HF repo id. llama-160m for CPU development; a 7B for GPU runs, where a small "
+        "model would make TP look bad for the wrong reason (launch overhead, not comms).",
+    )
     parser.add_argument("--threads-per-rank", type=int, default=1)
     parser.add_argument("--port", type=int, default=29511)
     args = parser.parse_args()
@@ -392,12 +400,14 @@ def _main() -> None:
         "microbatches": args.microbatches,
         "routing": args.routing,
         "random_weights": args.random_weights,
+        "model": args.model,
         "threads_per_rank": args.threads_per_rank,
         "port": args.port,
     }
 
     print(
-        f"backend={args.backend}  batch={args.batch}  seq={args.seq}  layers={args.layers}  "
+        f"model={args.model}  backend={args.backend}  batch={args.batch}  "
+        f"seq={args.seq}  layers={args.layers}  "
         f"microbatches={args.microbatches}  routing={args.routing}"
     )
     print(

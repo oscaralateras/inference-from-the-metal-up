@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -207,9 +208,22 @@ def random_block(seed: int = 0) -> TransformerBlock:
 
 
 def load_block(layer: int = 0, model_id: str = MODEL_ID) -> TransformerBlock:
-    """Load one real transformer block straight from safetensors, without building the model."""
+    """Load one real transformer block straight from safetensors, without building the model.
+
+    Head counts are read from the model's own `config.json` rather than assumed. Hardcoding them
+    silently produces a wrong `head_dim` on any other checkpoint (Mistral-7B's 4096 hidden over an
+    assumed 12 heads gives 341 instead of 128) — the tensors still load, the shapes still line up,
+    and the attention is quietly nonsense.
+    """
+    import json
+
     from huggingface_hub import hf_hub_download
     from safetensors import safe_open
+
+    cfg = json.loads(Path(hf_hub_download(repo_id=model_id, filename="config.json")).read_text())
+    n_heads = int(cfg["num_attention_heads"])
+    n_kv_heads = int(cfg.get("num_key_value_heads", n_heads))
+    head_dim = int(cfg.get("head_dim", cfg["hidden_size"] // n_heads))
 
     path = hf_hub_download(repo_id=model_id, filename="model.safetensors")
     prefix = f"model.layers.{layer}"
@@ -231,7 +245,6 @@ def load_block(layer: int = 0, model_id: str = MODEL_ID) -> TransformerBlock:
             raise KeyError(f"missing tensors in {model_id}: {missing}")
         p = {k: f.get_tensor(v).float() for k, v in names.items()}
 
-    head_dim = p["q"].shape[0] // N_HEADS
     return TransformerBlock(
         q=p["q"],
         k=p["k"],
@@ -242,7 +255,7 @@ def load_block(layer: int = 0, model_id: str = MODEL_ID) -> TransformerBlock:
         down=p["down"],
         attn_norm=p["attn_norm"],
         mlp_norm=p["mlp_norm"],
-        n_heads=N_HEADS,
-        n_kv_heads=p["k"].shape[0] // head_dim,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
         head_dim=head_dim,
     )
