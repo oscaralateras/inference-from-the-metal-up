@@ -94,32 +94,45 @@ class TransformerBlock:
     # ---- forward -------------------------------------------------------------------------
 
     def attention(self, x: torch.Tensor, kv_source: torch.Tensor | None = None) -> torch.Tensor:
-        """Causal multi-head attention over `x`.
+        """Causal multi-head attention over `x`, shape **(batch, seq, hidden)**.
+
+        The batch and sequence axes are kept **separate and explicit**, which matters more here
+        than it would in ordinary model code: the whole point of T5 is that different strategies
+        split different axes. Data parallelism splits `batch`; sequence parallelism splits `seq`.
+        Collapse them into one "tokens" axis and DP silently becomes SP-without-the-gather — it
+        will run, it will be fast, and it will be wrong, because attention mixes tokens along
+        `seq` but never along `batch`.
 
         `kv_source` exists for sequence parallelism: a rank holding only a slice of the sequence
-        must still attend over the *whole* sequence, so it computes queries from its own slice but
-        keys and values from the gathered full sequence. When None (every other strategy) it is
-        just `x`, and this is ordinary self-attention.
+        computes queries from its own slice but keys and values from the gathered full sequence.
+        When None (every other strategy) it is just `x`, and this is ordinary self-attention.
         """
+        if x.dim() != 3:
+            raise ValueError(
+                f"expected (batch, seq, hidden), got shape {tuple(x.shape)}. The batch and "
+                "sequence axes must stay distinct — see this method's docstring."
+            )
         kv_input = x if kv_source is None else kv_source
-        q_len, kv_len = x.shape[0], kv_input.shape[0]
+        b, q_len, _ = x.shape
+        kv_len = kv_input.shape[1]
 
-        q = (x @ self.q.T).view(q_len, -1, self.head_dim).transpose(0, 1)
-        k = (kv_input @ self.k.T).view(kv_len, -1, self.head_dim).transpose(0, 1)
-        v = (kv_input @ self.v.T).view(kv_len, -1, self.head_dim).transpose(0, 1)
+        # (b, len, n*hd) -> (b, n, len, hd)
+        q = (x @ self.q.T).view(b, q_len, -1, self.head_dim).transpose(1, 2)
+        k = (kv_input @ self.k.T).view(b, kv_len, -1, self.head_dim).transpose(1, 2)
+        v = (kv_input @ self.v.T).view(b, kv_len, -1, self.head_dim).transpose(1, 2)
 
-        if k.shape[0] != q.shape[0]:  # GQA: repeat each kv head to cover its query group
-            k = k.repeat_interleave(q.shape[0] // k.shape[0], dim=0)
-            v = v.repeat_interleave(q.shape[0] // v.shape[0], dim=0)
+        if k.shape[1] != q.shape[1]:  # GQA: repeat each kv head to cover its query group
+            k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
+            v = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
 
         scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        # Causal mask. With SP the queries are a slice starting at `kv_len - q_len`, so the
-        # mask must be offset by that amount or the slice would attend to its own future.
+        # Causal mask. Under SP the queries are a slice starting at `kv_len - q_len`, so the mask
+        # must be offset by that amount or the slice would attend to its own future.
         offset = kv_len - q_len
-        causal = torch.ones(q_len, kv_len, dtype=torch.bool).tril(diagonal=offset)
+        causal = torch.ones(q_len, kv_len, dtype=torch.bool, device=x.device).tril(diagonal=offset)
         scores = scores.masked_fill(~causal, float("-inf"))
 
-        out = (torch.softmax(scores, dim=-1) @ v).transpose(0, 1).reshape(q_len, -1)
+        out = (torch.softmax(scores, dim=-1) @ v).transpose(1, 2).reshape(b, q_len, -1)
         return out @ self.o.T
 
     def mlp(self, x: torch.Tensor) -> torch.Tensor:

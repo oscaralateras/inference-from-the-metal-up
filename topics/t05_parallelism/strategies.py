@@ -48,7 +48,11 @@ STRATEGIES = ("dp", "tp", "pp", "sp", "ep")
 
 # Workload. TOKENS is the sequence the block processes per step; LAYERS is the model depth that
 # pipeline parallelism has to divide. Both are deliberately modest on CPU and overridden for GPU.
-DEFAULT_TOKENS = 256
+# Batch and sequence are kept as SEPARATE axes because the strategies split different ones:
+# DP and PP split `batch`, SP splits `seq`. Collapsing them into one "tokens" axis makes DP
+# silently become sequence-parallelism-without-the-gather — fast, plausible, and wrong.
+DEFAULT_BATCH = 16
+DEFAULT_SEQ = 128
 DEFAULT_LAYERS = 8
 DEFAULT_MICROBATCHES = 8
 N_EXPERTS = 8
@@ -90,7 +94,7 @@ def step_dp(
     coordinate. That is DP's whole appeal, and also its whole limit: it needs the entire model to
     fit on one device, so it buys throughput and never capacity.
     """
-    per = x.shape[0] // world
+    per = x.shape[0] // world  # split the BATCH axis: sequences are independent of each other
     local = x[rank * per : (rank + 1) * per]
     for _ in range(layers):
         local = block.forward(local)
@@ -142,7 +146,7 @@ def step_pp(
     flight and why small decode batches suit it so badly.
     """
     layers_here = layers // world
-    per = x.shape[0] // microbatches
+    per = x.shape[0] // microbatches  # microbatches partition the BATCH axis
     comms = 0
     collected: list[torch.Tensor] = []
 
@@ -150,7 +154,7 @@ def step_pp(
         if rank == 0:
             h = x[m * per : (m + 1) * per].clone()
         else:
-            h = torch.empty(per, x.shape[1], dtype=x.dtype, device=x.device)
+            h = torch.empty(per, x.shape[1], x.shape[2], dtype=x.dtype, device=x.device)
             dist.recv(h, src=rank - 1)
 
         for _ in range(layers_here):
@@ -169,7 +173,7 @@ def step_pp(
             dist.send(out, dst=0)
             return None, comms
         if rank == 0:
-            out = torch.empty(x.shape[0], x.shape[1], dtype=x.dtype, device=x.device)
+            out = torch.empty_like(x)
             dist.recv(out, src=world - 1)
             return out, comms
         return None, comms
@@ -186,9 +190,9 @@ def step_sp(
     token, so each rank must all-gather the normed hidden state to build keys and values over the
     full sequence. That gather is SP's characteristic cost and it grows with sequence length.
     """
-    per = x.shape[0] // world
+    per = x.shape[1] // world  # split the SEQUENCE axis - this is what makes SP not DP
     lo = rank * per
-    local = x[lo : lo + per]
+    local = x[:, lo : lo + per]
     comms = 0
 
     for _ in range(layers):
@@ -196,16 +200,16 @@ def step_sp(
         parts = [torch.empty_like(normed_local) for _ in range(world)]
         dist.all_gather(parts, normed_local)
         comms += _elem_bytes(normed_local) * (world - 1)
-        full = torch.cat(parts, dim=0)
+        full = torch.cat(parts, dim=1)
 
         # Causal: this slice only ever attends to tokens at or before its own end.
-        attn = block.attention(normed_local, kv_source=full[: lo + per])
+        attn = block.attention(normed_local, kv_source=full[:, : lo + per])
         h = local + attn
         local = h + block.mlp(rms_norm(h, block.mlp_norm))  # per-token, no comms
 
     gathered = [torch.empty_like(local) for _ in range(world)] if rank == 0 else None
-    dist.gather(local, gathered, dst=0)
-    return (torch.cat(gathered, dim=0) if rank == 0 and gathered else None), comms
+    dist.gather(local.contiguous(), gathered, dst=0)
+    return (torch.cat(gathered, dim=1) if rank == 0 and gathered else None), comms
 
 
 def step_ep(
@@ -220,18 +224,19 @@ def step_ep(
     """
     experts_per_rank = moe.n_experts // world
     lo = rank * experts_per_rank
-    out = torch.zeros_like(x)
+    flat = x.reshape(-1, x.shape[-1])  # routing is per token, so batch and seq collapse here
+    out = torch.zeros_like(flat)
 
     for e in range(lo, lo + experts_per_rank):
         idx = (assignment == e).nonzero(as_tuple=True)[0]
         if idx.numel():
-            out[idx] = moe.forward_expert(e, x[idx])
+            out[idx] = moe.forward_expert(e, flat[idx])
 
     # Combine: every rank filled disjoint rows, so summing reconstructs the full output. A
     # production stack uses all-to-all instead (send tokens to the owning rank rather than
     # broadcasting all of them); this over-communicates but isolates the imbalance cleanly.
     dist.all_reduce(out)
-    return (out if rank == 0 else None), _elem_bytes(out)
+    return (out.view_as(x) if rank == 0 else None), _elem_bytes(out)
 
 
 # --------------------------------------------------------------------------------------------
@@ -252,9 +257,10 @@ def _worker(rank: int, world: int, cfg: dict, out_path: str) -> None:
         torch.set_num_threads(max(1, cfg["threads_per_rank"]))
 
     block = (random_block() if cfg["random_weights"] else load_block(0)).to_device(device)
-    tokens, layers = cfg["tokens"], cfg["layers"]
+    batch, seq, layers = cfg["batch"], cfg["seq"], cfg["layers"]
+    tokens = batch * seq
     x = torch.randn(
-        tokens, block.hidden, generator=torch.Generator().manual_seed(11), dtype=torch.float32
+        batch, seq, block.hidden, generator=torch.Generator().manual_seed(11), dtype=torch.float32
     ).to(device)
 
     moe = build_moe(block.hidden, block.intermediate // 2, N_EXPERTS).to_device(device)
@@ -263,7 +269,7 @@ def _worker(rank: int, world: int, cfg: dict, out_path: str) -> None:
     # Reference output, computed identically on every rank so the check needs no extra comms.
     with torch.no_grad():
         if cfg["strategy"] == "ep":
-            reference = moe.forward(x, assignment)
+            reference = moe.forward(x.reshape(-1, x.shape[-1]), assignment).view_as(x)
         else:
             ref = x
             for _ in range(layers):
@@ -359,7 +365,8 @@ def _main() -> None:
     parser.add_argument("--backend", choices=("gloo", "nccl"), default="gloo")
     parser.add_argument("--world-sizes", default="1,2,4")
     parser.add_argument("--strategies", default=",".join(STRATEGIES))
-    parser.add_argument("--tokens", type=int, default=DEFAULT_TOKENS)
+    parser.add_argument("--batch", type=int, default=DEFAULT_BATCH)
+    parser.add_argument("--seq", type=int, default=DEFAULT_SEQ)
     parser.add_argument("--layers", type=int, default=DEFAULT_LAYERS)
     parser.add_argument("--microbatches", type=int, default=DEFAULT_MICROBATCHES)
     parser.add_argument("--routing", choices=("uniform", "skewed"), default="uniform")
@@ -372,7 +379,8 @@ def _main() -> None:
     strategies = [s.strip() for s in args.strategies.split(",")]
     cfg = {
         "backend": args.backend,
-        "tokens": args.tokens,
+        "batch": args.batch,
+        "seq": args.seq,
         "layers": args.layers,
         "microbatches": args.microbatches,
         "routing": args.routing,
@@ -382,7 +390,7 @@ def _main() -> None:
     }
 
     print(
-        f"backend={args.backend}  tokens={args.tokens}  layers={args.layers}  "
+        f"backend={args.backend}  batch={args.batch}  seq={args.seq}  layers={args.layers}  "
         f"microbatches={args.microbatches}  routing={args.routing}"
     )
     print(
@@ -397,6 +405,10 @@ def _main() -> None:
             if strategy == "pp" and args.layers % world:
                 continue  # depth must divide across stages
             if strategy == "ep" and N_EXPERTS % world:
+                continue
+            if strategy == "dp" and args.batch % world:
+                continue
+            if strategy == "sp" and args.seq % world:
                 continue
             try:
                 r = run(strategy, world, cfg)
