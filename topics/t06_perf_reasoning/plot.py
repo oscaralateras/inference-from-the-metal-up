@@ -70,10 +70,14 @@ def plot_error_budget(rows: list[dict[str, str]], device_name: str) -> Path:
 
 
 def plot_serving_tradeoff(rows: list[dict[str, str]], device_name: str) -> Path:
-    """Throughput against tail latency across batch sizes — the real serving decision.
+    """Throughput against request latency across batch sizes — the real serving decision.
 
-    Batching buys throughput and charges for it in p99. Plotting the two against each other shows
-    the knee directly, which a pair of separate curves against batch size does not.
+    Batching buys throughput and charges for it in latency. Plotting the two against each other
+    shows the knee directly, which a pair of separate curves against batch size does not.
+
+    The x-axis is **not** a tail statistic. Every request in a batch here starts and finishes
+    together, so p50 and p99 coincide exactly; labelling it p99 would imply a distribution the
+    measurement does not have. A real tail needs staggered arrivals from a load generator.
     """
     throughput = dict(select(rows, "batching", "cuda_graphs", "tokens_per_sec"))
     p99 = dict(select(rows, "batching", "cuda_graphs", "request_latency_p99_ms"))
@@ -90,9 +94,9 @@ def plot_serving_tradeoff(rows: list[dict[str, str]], device_name: str) -> Path:
             fontsize=8,
         )
 
-    ax.set_xlabel("request p99 latency (ms)")
+    ax.set_xlabel("request latency, 128 output tokens (ms)")
     ax.set_ylabel("throughput (tokens / sec)")
-    ax.set_title(f"Batching buys throughput with tail latency — {device_name}")
+    ax.set_title(f"Batching buys throughput with latency — {device_name}")
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
 

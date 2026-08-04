@@ -1,0 +1,20 @@
+{
+  "model": "Qwen/Qwen2.5-7B",
+  "dtype": "bfloat16",
+  "seq_len": 512,
+  "session_id": "6c79f20d6c13",
+  "device_name": "NVIDIA A100-SXM4-80GB",
+  "peak_bandwidth_gbps": 1734.8412889335225,
+  "ridge_point_flops_per_byte": 151.96005911079652,
+  "total_params": 7615487488,
+  "params_read_per_token": 7070490112,
+  "flops_per_token": 14140980224,
+  "weight_bytes_per_token": 14140980224,
+  "kv_bytes_per_token": 29360128,
+  "activation_bytes_per_token": 7053312,
+  "arithmetic_intensity": 1.0,
+  "naive_tokens_per_sec": 122.68182696339244,
+  "full_tokens_per_sec": 122.36672903699674,
+  "naive_within_factor": 2.0,
+  "max_unexplained_fraction": 0.25
+}
