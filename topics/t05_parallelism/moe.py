@@ -51,10 +51,10 @@ class MoELayer:
         per = self.gate[0].numel() + self.up[0].numel() + self.down[0].numel()
         return per * self.gate.element_size()
 
-    def to_device(self, device: torch.device) -> MoELayer:
-        """Move every expert's tensors to `device`. Returns self for chaining."""
+    def to_device(self, device: torch.device, dtype: torch.dtype = torch.float32) -> MoELayer:
+        """Move every expert's tensors to `device` and `dtype`. Returns self for chaining."""
         for name in ("gate", "up", "down"):
-            setattr(self, name, getattr(self, name).to(device))
+            setattr(self, name, getattr(self, name).to(device=device, dtype=dtype))
         return self
 
     def forward_expert(self, expert: int, x: torch.Tensor) -> torch.Tensor:

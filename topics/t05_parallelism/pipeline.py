@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass
 
 import torch
-from model import TransformerBlock, load_block
+from model import MODEL_ID, TransformerBlock, load_block
 from results_io import append_rows
 from workload import assert_pinned, pin_single_thread
 
@@ -184,10 +184,16 @@ def sweep(
 
 
 def _main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Experiment B - the pipeline bubble")
+    parser.add_argument("--model", default=MODEL_ID, help="HF repo id for the transformer block")
+    args = parser.parse_args()
+
     pin_single_thread()
     assert_pinned()
 
-    block = load_block(0)
+    block = load_block(0, args.model)
     layer_s = calibrate_stage_seconds(block, 1)
     stage_ms = layer_s * LAYERS_PER_STAGE * 1e3
     print(

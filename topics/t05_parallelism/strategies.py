@@ -79,6 +79,16 @@ def _elem_bytes(t: torch.Tensor) -> int:
     return t.numel() * t.element_size()
 
 
+def _gather_buffers(t: torch.Tensor, world: int) -> list[torch.Tensor]:
+    """Destination buffers for all_gather that are guaranteed contiguous.
+
+    `torch.empty_like` preserves the source's *strides*, so building buffers from a non-contiguous
+    slice (sequence parallelism holds `x[:, lo:hi]`) yields non-contiguous destinations. gloo
+    tolerates that; NCCL does not. Allocating from the shape sidesteps it on every backend.
+    """
+    return [torch.empty(tuple(t.shape), dtype=t.dtype, device=t.device) for _ in range(world)]
+
+
 # --------------------------------------------------------------------------------------------
 # the five strategies. each returns (output_or_None, comms_bytes) for ONE step.
 # only rank 0 returns a reconstructed output; the rest return None.
@@ -103,7 +113,7 @@ def step_dp(
     # unchanged on both backends. The reassembly exists only so the correctness check can compare
     # against the unsharded forward — a real DP server never does it (each rank returns its own
     # requests) — so it is excluded from the comms accounting below.
-    gathered = [torch.empty_like(local) for _ in range(world)]
+    gathered = _gather_buffers(local, world)
     dist.all_gather(gathered, local.contiguous())
     return (torch.cat(gathered, dim=0) if rank == 0 else None), 0
 
@@ -175,7 +185,7 @@ def step_pp(
             dist.send(out, dst=0)
             return None, comms
         if rank == 0:
-            out = torch.empty_like(x)
+            out = torch.empty(tuple(x.shape), dtype=x.dtype, device=x.device)
             dist.recv(out, src=world - 1)
             return out, comms
         return None, comms
@@ -199,8 +209,8 @@ def step_sp(
 
     for _ in range(layers):
         normed_local = rms_norm(local, block.attn_norm)
-        parts = [torch.empty_like(normed_local) for _ in range(world)]
-        dist.all_gather(parts, normed_local)
+        parts = _gather_buffers(normed_local, world)
+        dist.all_gather(parts, normed_local.contiguous())
         comms += _elem_bytes(normed_local) * (world - 1)
         full = torch.cat(parts, dim=1)
 
@@ -210,7 +220,7 @@ def step_sp(
         local = h + block.mlp(rms_norm(h, block.mlp_norm))  # per-token, no comms
 
     # all_gather, not gather: NCCL has no gather. Reassembly is for the correctness check only.
-    gathered = [torch.empty_like(local) for _ in range(world)]
+    gathered = _gather_buffers(local, world)
     dist.all_gather(gathered, local.contiguous())
     return (torch.cat(gathered, dim=1) if rank == 0 else None), comms
 
@@ -251,24 +261,29 @@ def _worker(rank: int, world: int, cfg: dict, out_path: str) -> None:
     backend = cfg["backend"]
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", str(cfg["port"]))
-    dist.init_process_group(backend=backend, rank=rank, world_size=world)
 
-    device = torch.device(f"cuda:{rank}") if backend == "nccl" else torch.device("cpu")
+    # set_device BEFORE init_process_group: NCCL binds a rank to a device at init, and leaving it
+    # to default puts every rank on cuda:0 -- which deadlocks or silently serialises.
     if backend == "nccl":
         torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank}")
     else:
         torch.set_num_threads(max(1, cfg["threads_per_rank"]))
+        device = torch.device("cpu")
 
+    dist.init_process_group(backend=backend, rank=rank, world_size=world)
+
+    dtype = getattr(torch, cfg["dtype"])
     block = (random_block() if cfg["random_weights"] else load_block(0, cfg["model"])).to_device(
-        device
+        device, dtype
     )
     batch, seq, layers = cfg["batch"], cfg["seq"], cfg["layers"]
     tokens = batch * seq
-    x = torch.randn(
-        batch, seq, block.hidden, generator=torch.Generator().manual_seed(11), dtype=torch.float32
-    ).to(device)
+    x = torch.randn(batch, seq, block.hidden, generator=torch.Generator().manual_seed(11)).to(
+        device=device, dtype=dtype
+    )
 
-    moe = build_moe(block.hidden, block.intermediate // 2, N_EXPERTS).to_device(device)
+    moe = build_moe(block.hidden, block.intermediate // 2, N_EXPERTS).to_device(device, dtype)
     assignment = route(tokens, N_EXPERTS, cfg["routing"], seed=5).to(device)
 
     # Reference output, computed identically on every rank so the check needs no extra comms.
@@ -386,6 +401,13 @@ def _main() -> None:
         help="HF repo id. llama-160m for CPU development; a 7B for GPU runs, where a small "
         "model would make TP look bad for the wrong reason (launch overhead, not comms).",
     )
+    parser.add_argument(
+        "--dtype",
+        choices=("float32", "bfloat16", "float16"),
+        default="float32",
+        help="bfloat16 for GPU runs: fp32 does not use tensor cores, so fp32 GPU numbers would "
+        "not represent how inference is actually served.",
+    )
     parser.add_argument("--threads-per-rank", type=int, default=1)
     parser.add_argument("--port", type=int, default=29511)
     args = parser.parse_args()
@@ -402,11 +424,12 @@ def _main() -> None:
         "random_weights": args.random_weights,
         "model": args.model,
         "threads_per_rank": args.threads_per_rank,
+        "dtype": args.dtype,
         "port": args.port,
     }
 
     print(
-        f"model={args.model}  backend={args.backend}  batch={args.batch}  "
+        f"model={args.model}  backend={args.backend}  dtype={args.dtype}  batch={args.batch}  "
         f"seq={args.seq}  layers={args.layers}  "
         f"microbatches={args.microbatches}  routing={args.routing}"
     )
