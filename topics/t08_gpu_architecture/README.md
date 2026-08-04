@@ -108,21 +108,26 @@ compute-per-byte, and a datacentre part optimised for tensor-core throughput can
 
 ## Where this sits against production kernels
 
-**1.56× is well short of what the technique can deliver, and the shortfall is implementation, not
-physics.** Marlin and the AWQ/GPTQ kernels reach close to the full byte ratio at batch 1 on this
-class of hardware. So the ceiling is reachable; this kernel does not reach it.
+**1.56× is short of what the technique can deliver, and the measurement points at why.** Production
+int4 kernels — Marlin, AWQ, the GPTQ family — attack precisely the term this topic identifies as
+binding, by two mechanisms:
 
-The difference is specific and nameable. Those kernels avoid the integer→float conversion entirely,
-bit-stuffing nibbles into fp16 mantissas so the unpack is a mask and an add rather than a
-conversion instruction, and they dequantise directly into tensor-core layouts so the multiply
-leaves the vector units altogether. That takes the per-byte arithmetic from ~8 operations to
-roughly 1–2 — which is exactly the term this measurement identifies as binding.
+1. **They avoid the integer→float conversion.** A 4-bit code is OR-ed into the mantissa of a
+   constant-exponent fp16 and the bias subtracted, so unpacking is a mask and an add rather than a
+   conversion instruction.
+2. **They dequantise into tensor-core layouts**, moving the multiply off the vector units entirely.
 
-Stated plainly because the alternative reading is wrong: **this is not evidence that quantisation
-fails to pay on an A100.** It is a measurement of what a straightforward fused kernel costs, and an
-identification of which cost the production kernels engineer away. A naive fused kernel is the
-right thing to write first and the wrong thing to ship, and the gap between the two is the ~6
-operations per byte above.
+Both reduce operations per byte, which is the quantity the per-byte accounting above says decides
+the outcome. No claim is made here about what multiple they achieve — that would be quoting someone
+else's benchmark rather than reporting one, which is what the rest of this repo exists not to do.
+
+Worth stating plainly because the alternative reading is wrong: **this is not evidence that
+quantisation fails to pay.** It is a measurement of what a straightforward fused kernel costs on one
+GPU at batch 1, and an identification of which cost the production kernels are built to remove.
+
+Note also that mechanism 2 is unavailable at M=1: with a single output column there is nothing for
+a tensor core to do. So the batch-1 decode case measured here is the *hardest* case for quantised
+kernels, not the representative one — a batched serving path has a lever this one does not.
 
 ## Why the dequantisation has to live inside the kernel
 
