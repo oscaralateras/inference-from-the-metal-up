@@ -22,10 +22,11 @@ compute moves it. Batching is what escapes the wall.*
 | [T2](topics/t02_cpu_pipeline) | CPU execution & the pipeline | Fitting the pipeline is worth **1.8×–3.2×** on identical arithmetic: branch 1.76×, ILP 3.20×, SIMD 2.35×. | Decode lands on the wrong side of all three. The serial token dependency is why batching exists. |
 | [T3](topics/t03_memory_hierarchy) | Memory hierarchy & the memory wall | Traversal order is worth **~20×** — and the memory-bound crossover is set by the device's **ridge point**, not by the kernel. | Decode is memory-bound *specifically on GPUs* (ridge ≈ 200 vs CPU ≈ 0.18). Batching raises arithmetic intensity; that is continuous batching's whole lever. |
 | [T4](topics/t04_concurrency) | Concurrency & synchronization | Coordination taxes, all on identical work: memory layout alone **17×**, an unsynchronised counter is **78% wrong**, a locked queue costs **456×** vs sharding. | A single-lock scheduler caps tokens/sec no matter how much GPU you attach. Real engines shard dispatch — this is why. |
+| [T5](topics/t05_parallelism) | Parallelism: five ways to split a transformer | Scaling order is **not** communication order. On 4× A100 NVLink: DP **3.77×** (0 MB/step), TP **2.96×** (940 MB), PP **2.48×** (59 MB) — a bubble costs more than bandwidth. Routing skew alone costs EP **55%**. | There is no best strategy, only which bill you can afford: DP and SP scale best and replicate the whole model, so neither can serve one that doesn't fit. |
 
 ## Roadmap
 
-Eleven topics, built in order. Four shipped; the rest are scoped and planned.
+Eleven topics, built in order. Five shipped; the rest are scoped and planned.
 
 | | Topic | Language | Status |
 |---|---|---|---|
@@ -33,7 +34,7 @@ Eleven topics, built in order. Four shipped; the rest are scoped and planned.
 | T2 | CPU execution & the pipeline | C | ✅ shipped |
 | T3 | Memory hierarchy | C + PyTorch | ✅ shipped |
 | T4 | Concurrency & synchronization | Rust | ✅ shipped |
-| T5 | Parallelism taxonomy | Python | planned |
+| T5 | Parallelism: five ways to split a transformer | Python · 4× GPU | ✅ shipped |
 | T6 | Performance reasoning | Python · GPU | planned |
 | T7 | Roofline model & arithmetic intensity | Python · GPU | planned |
 | T8 | GPU architecture (tiled matmul) | Triton · GPU | planned |
@@ -45,8 +46,9 @@ Eleven topics, built in order. Four shipped; the rest are scoped and planned.
 
 The numbers are only worth reading if the method is honest, so:
 
-- **Author on the Mac; measure on Linux x86.** Canonical numbers come from an **AMD EPYC-Milan** box
-  (Hetzner CCX33, Ubuntu 24.04, 64-byte cache line); GPU results from a T4. `rdtsc`, cache sizes,
+- **Author on the Mac; measure on real hardware.** Canonical CPU numbers come from an **AMD
+  EPYC-Milan** box (Hetzner CCX33, Ubuntu 24.04, 64-byte cache line); GPU results from a T4 (T3)
+  and **4× A100 SXM on NV12 NVLink** (T5). `rdtsc`, cache sizes,
   cache-line width and branch-prediction behaviour all differ on Apple Silicon, which would make the
   numbers non-canonical. Every lab note states the hardware it ran on.
 - **Use the language that tells the truth.** C and Rust where cycle-level effects matter (T2–T4) —
