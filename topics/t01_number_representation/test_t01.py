@@ -61,3 +61,44 @@ def test_cosine_ignores_scale_but_relerr_does_not() -> None:
     b = a * 2.0  # same direction, double magnitude
     assert cosine_similarity(a, b) == pytest.approx(1.0, abs=1e-5)
     assert relative_error(a, b) == pytest.approx(1.0, abs=1e-4)  # 100% error
+
+
+def test_lab_note_numbers_match_the_results() -> None:
+    """Every headline figure in the write-up must be recomputable from the results file.
+
+    This topic originally persisted nothing — its table was transcribed by hand from stdout, so a
+    re-run that changed the numbers would have left the note quietly wrong with nothing to catch
+    it. T5 shipped with a guard like this after exactly that happened; T6 and T7 have one too.
+    """
+    import csv
+    from pathlib import Path
+
+    import pytest
+
+    results = Path(__file__).parent / "results" / "quantisation.csv"
+    note = Path(__file__).parent / "README.md"
+    if not results.exists():
+        pytest.skip("run probe.py to generate results/quantisation.csv")
+
+    with results.open() as f:
+        rows = list(csv.DictReader(f))
+
+    def value(variant: str, n_bits: int, metric: str) -> float:
+        hits = [
+            float(r["value"])
+            for r in rows
+            if r["variant"] == variant and int(r["x"]) == n_bits and r["metric"] == metric
+        ]
+        assert len(hits) == 1, f"expected one {variant}/{n_bits}/{metric}, found {len(hits)}"
+        return hits[0]
+
+    text = note.read_text()
+    claims = {
+        "int4 per-tensor error": f"{value('per_tensor', 4, 'output_relative_error') * 100:.1f}",
+        "int4 per-tensor cosine": f"{value('per_tensor', 4, 'output_cosine'):.3f}",
+        "int4 per-group error": f"{value('per_group', 4, 'output_relative_error') * 100:.1f}",
+        "int4 per-group cosine": f"{value('per_group', 4, 'output_cosine'):.4f}",
+        "int4 per-tensor SQNR": f"{value('per_tensor', 4, 'output_sqnr_db'):.1f}",
+    }
+    for label, quoted in claims.items():
+        assert quoted in text, f"README no longer quotes the measured {label}: {quoted}"

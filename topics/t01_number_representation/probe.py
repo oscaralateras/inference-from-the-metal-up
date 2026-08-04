@@ -16,12 +16,26 @@ fidelity two ways:
 from __future__ import annotations
 
 import itertools
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from load_weights import load_linear_weight
 from metrics import FloatArray, cosine_similarity, relative_error, sqnr_db
 from quantise import Granularity, dequantise, quantise_symmetric
+
+# T1 predates `arch_common` and runs as a script from its own directory, so the repo root is not
+# on the path. Three lines here beats restructuring a finished topic's imports.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from arch_common.results_io import append_rows  # noqa: E402
+
+CSV_PATH = Path(__file__).parent / "results" / "quantisation.csv"
+
+# T1 is pure numerics on a fixed tensor with a fixed seed — the same anywhere, on any machine.
+# It has no hardware session to belong to, and saying so is more honest than inventing one.
+SESSION = "cpu-deterministic"
 
 BIT_WIDTHS = [8, 7, 6, 5, 4, 3, 2]
 GRANULARITIES: list[Granularity] = ["per_tensor", "per_channel", "per_group"]
@@ -77,7 +91,36 @@ def run_sweep() -> tuple[list[Result], FloatArray]:
             f"{r.n_bits:>6} {r.granularity:>12} {r.w_sqnr:>8.2f} "
             f"{r.out_sqnr:>9.2f} {r.out_relerr * 100:>9.2f} {r.out_cos:>9.5f}"
         )
+    write_results(results)
     return results, w
+
+
+def write_results(results: list[Result]) -> None:
+    """Persist the sweep so the lab note's numbers can be checked against it.
+
+    This topic originally printed its table and nothing else, so every figure quoted in the write-up
+    was transcribed by hand with nothing to catch a divergence. `test_t01.py` now compares the two.
+    """
+    append_rows(
+        CSV_PATH,
+        [
+            {
+                "session_id": SESSION,
+                "experiment": "quantisation",
+                "variant": r.granularity,
+                "x": r.n_bits,
+                "metric": metric,
+                "value": value,
+            }
+            for r in results
+            for metric, value in (
+                ("weight_sqnr_db", r.w_sqnr),
+                ("output_sqnr_db", r.out_sqnr),
+                ("output_relative_error", r.out_relerr),
+                ("output_cosine", r.out_cos),
+            )
+        ],
+    )
 
 
 if __name__ == "__main__":
