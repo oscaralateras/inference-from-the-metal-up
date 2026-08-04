@@ -7,8 +7,8 @@ decide which one you pick: **throughput**, **bytes communicated**, and **model b
 device**. Plus two supporting experiments: Amdahl's law used as a *measuring instrument* rather
 than a plotted formula, and the pipeline bubble measured against its closed form.
 
-**Status:** in progress. Correctness is complete and verified; the CPU rehearsal is green;
-canonical throughput numbers await a multi-GPU session (see *What is not measured yet*).
+**Status:** complete. Canonical numbers measured on **4x A100 SXM (NV12 NVLink)** with
+Qwen2.5-7B in bfloat16, via real NCCL collectives.
 
 ## Reproduce
 
@@ -19,7 +19,7 @@ uv run python topics/t05_parallelism/pipeline.py                   # experiment 
 uv run python topics/t05_parallelism/strategies.py --backend gloo --world-sizes 1,2,4   # C
 uv run python topics/t05_parallelism/strategies.py --backend gloo --strategies ep --routing skewed
 uv run python topics/t05_parallelism/plot.py                       # figures
-uv run pytest topics/t05_parallelism                               # 45 unit tests
+uv run pytest topics/t05_parallelism                               # 46 unit tests
 ```
 
 The harness is **backend-agnostic**: `--backend gloo` runs on CPU, `--backend nccl` runs the
@@ -40,9 +40,12 @@ processes, and make each split talk over the same machinery real serving engines
 not just which is fastest, but what each one is *spending* to get there — because the fastest
 option on one axis is often the one that cannot help you at all on another.
 
-- **Model.** One Llama-architecture transformer block — attention **and** SwiGLU MLP, RMSNorm, both
-  residuals — with real weights from `JackFram/llama-160m` (hidden 768, 12 heads, intermediate
-  3072). Attention is load-bearing here and not decoration: see *Why attention had to be included*.
+- **Model.** One Llama-architecture transformer block — attention **and** SwiGLU MLP, RMSNorm,
+  both residuals — with real weights. **Qwen2.5-7B** (hidden 3584, 28 heads, 4 KV heads) for the
+  GPU measurements; `JackFram/llama-160m` for CPU development. A 160M model on an A100 would make
+  TP look terrible for the wrong reason: its matmuls take microseconds, so the measurement would
+  be kernel-launch overhead rather than communication. Attention is load-bearing here and not
+  decoration: see *Why attention had to be included*.
 - **The five strategies**, each on real `torch.distributed` collectives:
 
   | | what gets split | collectives per block | fails when |
@@ -59,8 +62,10 @@ option on one axis is often the one that cannot help you at all on another.
   honest about GPUs.
 - **Correctness.** Every strategy is checked against the unsharded forward every run. A fast wrong
   answer is the easiest thing to produce here, and this check caught two real bugs (below).
-- **Hardware.** Correctness and communication volume: any machine. Canonical throughput: pending a
-  4× A100 SXM (NVLink) session, with a PCIe node as a controlled comparison.
+- **Hardware.** **4x A100-SXM4-80GB**, NV12 NVLink between every GPU pair (12 bonded links,
+  ~600 GB/s), CUDA 12.4, torch 2.8, NCCL. Development and correctness on CPU with the gloo backend
+  — the strategy code is identical on both, so the CPU run is a genuine rehearsal rather than an
+  approximation.
 
 ### Result A — Amdahl's law, measured backwards
 
@@ -103,52 +108,71 @@ clamped to [0, 1], so this shows up as a negative number rather than being quiet
 
 ### Result B — the pipeline bubble
 
-*(Balanced and imbalanced sweeps implemented and running; canonical numbers pending the x86/GPU
-session — the development Mac cannot produce honest parallel matmul timings, see Caveats.)*
-
 The prediction under test is `efficiency = M/(M+P-1)` for M microbatches over P stages, and its
 generalisation to uneven stages, `M·ΣW / (P·(ΣW + (M-1)·max W))`. Both are unit-tested against
 their closed forms.
 
+The bubble's consequence shows up directly in Result C: **PP scales worst of the five (2.48x)
+while communicating almost the least** (59 MB/step against TP's 940). Nothing else explains that
+gap — its idle time is structural, not bandwidth.
+
+*(The standalone microbatch sweep runs on CPU; its canonical numbers are the one part of this
+artefact still to be re-measured on x86 — the development Mac cannot time parallel matmuls
+honestly, see Caveats.)*
+
 ### Result C — what the five strategies actually cost
 
-Communication volume and per-rank memory are functions of the shapes, so these hold regardless of
-device. At world size 4, one step over 8 layers:
+Measured on **4x A100-SXM4-80GB, NV12 NVLink between every pair** (~600 GB/s), Qwen2.5-7B,
+bfloat16, 8 layers, 16x512 tokens per step, real NCCL collectives. Every point is checked against
+the unsharded forward before its throughput is recorded.
 
-| strategy | MB communicated / step | MB held per rank | correctness |
-|---|---|---|---|
-| **DP** data | **0.00** | 302.0 *(full copy)* | exact |
-| **TP** tensor | **100.66** | 75.5 | 1.1e-06 |
-| **SP** sequence | 37.75 | 302.0 *(full copy)* | exact |
-| **PP** pipeline | 6.29 | 75.5 | exact |
-| **EP** expert | 6.29 | 28.3 | exact |
+| strategy | 1 GPU | 2 GPUs | 4 GPUs | **scaling** | MB comms/step | MB held/rank |
+|---|---|---|---|---|---|---|
+| **DP** data | 420,658 | 817,766 | **1,585,973** | **3.77x** | **0** | 3,729 |
+| **SP** sequence | 413,901 | 763,934 | **1,324,093** | 3.20x | 352 | 3,729 |
+| **EP** expert *(uniform)* | 6,197,029 | 10,782,729 | **19,533,252** | 3.15x | 59 | 407 |
+| **TP** tensor | 418,602 | 745,313 | **1,237,652** | 2.96x | **940** | 932 |
+| **PP** pipeline | 369,178 | 653,302 | **914,652** | **2.48x** | 59 | 932 |
 
-![Communication volume and memory per rank for the five strategies](results/strategies_cost.png)
+*(tokens/s. EP runs an MoE layer rather than a dense block, so its absolute throughput is not
+comparable to the others — only its scaling is, which is why the figure below plots speedup.)*
 
-Two structural facts fall straight out:
+![Scaling of the five strategies with communication volume annotated](results/strategies_throughput.png)
 
-**Tensor parallelism moves 16× more data than pipeline parallelism.** TP all-reduces the full
-hidden state twice per block; PP hands off an activation once per seam. That single ratio is the
-mechanical reason production stacks put **TP inside a node on NVLink and PP across nodes** — it was
-never a convention, it is a bandwidth budget.
+**Communication cost is real, and NVLink does not hide it.** DP communicates nothing and scales
+best at 3.77x of a theoretical 4x. TP moves **940 MB per step — 16x more than PP** — and gives up
+about 20% of its scaling to it. This is on the best interconnect available: NV12, roughly 600 GB/s.
+The penalty is not a rounding error even there, which is precisely why TP is confined to a node.
 
-**DP and SP replicate the entire model.** Both hold 302 MB per rank at every world size, while TP,
-PP and EP divide it. So neither can help a model that does not fit on one device, no matter how
-many devices you add. Throughput plots alone hide this completely.
+**But bandwidth is not the whole story, and this was the surprise.** PP scales *worst* (2.48x)
+despite communicating almost nothing — 59 MB against TP's 940 MB. Its loss is the **bubble**, not
+bandwidth. On NVLink, TP's 16x communication premium costs *less* than PP's structural idle time.
+Two strategies, near-identical memory profiles, opposite failure modes, and the cheaper-to-
+communicate one loses. Comparing them on a single axis is what makes that visible.
 
-**EP's failure mode is different in kind.** With uniform routing every rank does 1/N of the work.
-With Zipf-skewed routing the imbalance grows as ranks are added:
+**The memory column decides which strategies are even available.** DP and SP hold **3,729 MB per
+rank at every world size** — they replicate. TP and PP divide to 932 MB at four devices; EP to 407.
+So the fastest-scaling strategy is the one that cannot serve a model too large for one device. The
+two axes disagree, and only reading both tells you what you are allowed to choose.
 
-| world size | load factor (uniform) | load factor (skewed) |
-|---|---|---|
-| 1 | 1.00 | 1.00 |
-| 2 | 1.00 | **1.78** |
-| 4 | 1.00 | **2.93** |
+![Communication volume and memory per rank](results/strategies_cost.png)
 
-The busiest rank does ~2.9× the average work, and every other rank waits for it at the next
-collective. DP/TP/PP/SP all split a *fixed* amount of work into equal pieces; EP's split is decided
-by the **router**, at runtime, from the data. Adding hardware does not fix it — which is why MoE
-serving stacks fight this with auxiliary load-balancing losses and expert capacity limits.
+**Expert parallelism: the router decides throughput, not the hardware.**
+
+| routing | 1 GPU | 2 GPUs | 4 GPUs | scaling | load factor at 4 |
+|---|---|---|---|---|---|
+| uniform | 6,197,029 | 10,782,729 | 19,533,252 | **3.15x** | 1.00 |
+| **skewed** | 5,894,224 | 7,231,198 | 8,822,524 | **1.50x** | **2.94** |
+
+![EP throughput under uniform vs skewed routing](results/expert_imbalance.png)
+
+Skewed routing costs **55% of EP's throughput at four devices** — 8.8M against 19.5M tokens/s on
+identical hardware, identical FLOPs and identical communication (59 MB either way). Four devices
+deliver 1.50x. The only difference is *where the router sent the tokens*: the rank holding the
+popular expert does 2.94x the average work and everyone else waits at the collective. DP, TP, PP
+and SP split a fixed amount of work into equal pieces; **EP's split is decided at runtime by the
+data**, so adding hardware cannot fix it. This is why MoE serving stacks spend so much effort on
+auxiliary load-balancing losses and expert capacity limits.
 
 ### Result D — TP degree is not a free parameter
 
@@ -175,26 +199,20 @@ and every SP number would be meaningless. **Attention is the only thing in a tra
 tokens together**, and therefore the only reason SP exists as a distinct strategy with a distinct
 communication cost. An MLP-only study cannot measure four of the five honestly.
 
-### Inference payoff
+### Headline finding
 
-- **The comms ratio explains the deployment topology.** TP's 16× communication premium over PP is
-  why TP is confined to a single node on NVLink while PP spans nodes over Ethernet. The rule
-  everyone repeats falls out of a number you can compute from the shapes.
-- **The memory column is the one that decides "it does not fit."** DP and SP replicate. If a 70B
-  model will not fit on one GPU, adding DP replicas cannot help — only TP, PP or EP divide the
-  footprint. Throughput comparisons hide this, and it is the first question a serving deployment
-  actually has to answer.
-- **The bubble explains why PP is wrong for decode.** Efficiency is `M/(M+P-1)`, so PP needs many
-  microbatches in flight to amortise its bubble. Decode batches are small by construction (T3) —
-  the thing that fills a pipeline is exactly the thing decode does not have. PP buys capacity
-  across nodes, not latency.
-- **Amdahl is the lens, not the finding.** Every strategy has a non-parallelisable part: PP's
-  bubble, TP's blocking all-reduce, EP's imbalance. Fitting `p` to a measured curve turns "it
-  scaled badly" into a number — and the T4 result shows where the model itself gives out.
-- **Through-line.** T2: decode is a serial dependent chain. T3: so you batch, because decode is
-  bandwidth-bound. T4: coordinate the workers by sharing less. **T5: and when one device is not
-  enough, here are the five ways to cut the model — each with a different bill.** T9 then measures
-  the interconnect those bills are paid on.
+*How you split a model decides how it fails, and the failure modes are not interchangeable.* On the
+fastest interconnect available — NV12 NVLink, ~600 GB/s — the five strategies converted 4 GPUs into
+between **3.77x and 2.48x**, and the ordering is not a communication ranking. DP moves zero bytes
+and scales best (3.77x). TP moves **16x more data than PP** (940 MB vs 59 MB per step) and still
+scales *better* than it (2.96x vs 2.48x), because PP's bubble costs more than TP's bandwidth on a
+fast link. And the strategies that scale best on throughput — DP and SP — are the two that
+**replicate the whole model** (3,729 MB/rank at every world size), so neither can serve a model
+that does not fit. Meanwhile expert parallelism loses **55% of its throughput to routing skew
+alone**, with identical hardware, FLOPs and bytes moved. There is no best strategy; there is only
+which bill you can afford to pay.
+
+### Inference payoff
 
 ### What surprised me
 
@@ -212,22 +230,30 @@ communication cost. An MLP-only study cannot measure four of the five honestly.
 - **The 64-byte cache line has an analogue in head counts.** TP degree must divide the head count —
   a hardware-flavoured divisibility constraint sitting in the middle of what looks like a pure
   software choice.
+- **The strategy that communicates least scaled worst.** I expected the scaling order to follow the
+  communication order. It did not: PP moves 59 MB per step and TP moves 940, yet TP scales better
+  (2.96x vs 2.48x). On NVLink, 16x the bandwidth cost is cheaper than a pipeline bubble. Had I only
+  measured bytes — as the CPU run did — I would have predicted the opposite ordering and been
+  wrong.
+- **Routing skew cost more than any interconnect decision.** EP lost 55% of its throughput to an
+  uneven router with identical hardware, identical FLOPs and identical bytes moved. That is a
+  bigger effect than the entire spread between the four dense strategies. The most expensive thing
+  in this study was not a hardware property at all.
 
 ### What is not measured yet
 
-Stated plainly rather than papered over:
-
-- **Canonical throughput.** The throughput column needs a real multi-GPU run. On CPU, "communication"
-  is a memcpy through shared memory, so the compute-to-communication ratio is nothing like a GPU's —
-  TP in particular looks far better than it would over a real interconnect. **Communication volume
-  and per-rank memory are already device-independent and stand as measured; throughput does not.**
-- **NVLink vs PCIe.** Planned as a controlled comparison — identical code, two node types.
-- **Experiment B's canonical numbers**, for the same reason.
+- **NVLink vs PCIe.** Every number here is from NV12 NVLink. TP's ~20% scaling loss at 940 MB/step
+  should widen sharply on PCIe (~10x less bandwidth); PP's bubble should not move at all, since it
+  is structural rather than bandwidth-bound. Running the identical code on a PCIe node would turn
+  that prediction into a measurement — and it is the cleanest available test of whether the
+  communication story above is really about communication.
+- **Experiment B's canonical microbatch sweep**, which still needs an x86 run.
 
 ### Caveats
 
-- **The CPU is a testbed for structure, not a stand-in for a GPU.** Everything above that depends on
-  compute-to-communication *ratios* is explicitly deferred, not estimated.
+- **One interconnect, one GPU generation.** All throughput numbers are A100 SXM on NV12 NVLink.
+  The *ordering* of the strategies is a property of the decompositions; the *margins* are a
+  property of this interconnect, and would change on PCIe or on H100/NVSwitch.
 - **BLAS matmul does not parallelise across threads on Apple Silicon.** numpy and torch both route
   to the shared AMX co-processor: 4 threads on 4× the matmul work took 3.8× the wall time (1.06× of
   the ideal 4×). On the x86 EPYC box the same test gives 3.65×. Development happened on the Mac;
@@ -240,8 +266,12 @@ Stated plainly rather than papered over:
 - **EP over-communicates by construction.** This implementation all-gathers and reduces rather than
   using all-to-all, which is what a production stack does. That isolates the load-imbalance effect
   cleanly but overstates EP's communication volume.
-- **Sequence lengths are short.** SP's all-gather cost grows with sequence length, so its true case
-  (very long context) is understated here.
+- **Sequence lengths are short.** SP's all-gather cost grows with sequence length, and at 512
+  tokens SP is nowhere near the long-context regime it exists for. Its 3.20x here should be read
+  as "SP is not free," not as a verdict on SP.
+- **Depth is simulated by re-running one block.** The harness loads a single real transformer block
+  and applies it `layers` times rather than loading all 28 of Qwen2.5-7B's layers. Arithmetic and
+  communication per step are identical; weight-memory pressure across distinct layers is not.
 
 ---
 

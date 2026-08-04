@@ -233,38 +233,108 @@ def _strategy_experiment() -> str | None:
 
 
 def plot_strategies_throughput() -> None:
+    """Scaling, not absolute throughput — the only axis on which all five are comparable.
+
+    Absolute tokens/s would be dishonest here: expert parallelism runs an MoE layer (one expert
+    per token) rather than a dense block, so its raw numbers are an order of magnitude larger and
+    say nothing about the *decomposition*. Normalising each strategy to its own single-device
+    throughput removes the workload difference and leaves exactly the question being asked: how
+    well does this way of splitting the model convert extra devices into speed?
+    """
     exp = _strategy_experiment()
     if not exp:
         return
     curves = _series(exp, "tokens_per_s")
+    comms = _series(exp, "comms_bytes_per_step")
+    if not curves:
+        return
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    fig, ax = plt.subplots(figsize=(7.6, 4.8))
+    workers_all = sorted({w for pts in curves.values() for w in pts})
+    ax.plot(workers_all, workers_all, ":", color="#999999", linewidth=1.2, label="ideal (linear)")
+
     for variant, pts in sorted(curves.items()):
         key = variant.split("_")[0]
-        workers = sorted(pts)
+        ws = sorted(pts)
+        base = pts[min(ws)]
+        speedup = [pts[w] / base for w in ws]
+        skewed = variant.endswith("skewed")
+        name = LABEL.get(key, key) + (" (skewed routing)" if skewed else "")
+        mb = comms.get(variant, {}).get(max(ws), 0) / 1e6
         ax.plot(
-            workers,
-            [pts[w] / 1e3 for w in workers],
-            "o-",
+            ws,
+            speedup,
+            "o--" if skewed else "o-",
             color=COLOR.get(key, "#666666"),
             linewidth=1.8,
             markersize=5,
         )
         ax.annotate(
-            LABEL.get(key, variant),
-            xy=(max(workers), pts[max(workers)] / 1e3),
-            xytext=(5, 0),
+            f"{name}  {speedup[-1]:.2f}x   [{mb:,.0f} MB/step]",
+            xy=(max(ws), speedup[-1]),
+            xytext=(6, 0),
             textcoords="offset points",
             color=COLOR.get(key, "#666666"),
+            fontsize=8.5,
+            va="center",
+        )
+
+    _style_worker_axis(ax, workers_all)
+    ax.set_ylabel("speedup vs 1 device")
+    ax.set_title("Five ways to split a transformer — scaling, and what each pays to communicate")
+    ax.set_xlim(0.8, max(workers_all) * 2.15)
+    ax.legend(frameon=False, loc="upper left")
+    fig.savefig(RESULTS_DIR / "strategies_throughput.png", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_expert_imbalance() -> None:
+    """EP under uniform vs skewed routing — identical hardware, FLOPs and communication."""
+    exp = _strategy_experiment()
+    if not exp:
+        return
+    curves = _series(exp, "tokens_per_s")
+    loads = _series(exp, "load_factor")
+    if "ep_uniform" not in curves or "ep_skewed" not in curves:
+        return
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    for variant, color, label in (
+        ("ep_uniform", "#009E73", "uniform routing"),
+        ("ep_skewed", "#D55E00", "skewed routing"),
+    ):
+        ws = sorted(curves[variant])
+        ax.plot(
+            ws,
+            [curves[variant][w] / 1e6 for w in ws],
+            "o-",
+            color=color,
+            linewidth=2,
+            markersize=6,
+            label=label,
+        )
+        lf = loads.get(variant, {}).get(max(ws), 1.0)
+        ax.annotate(
+            f"{label}\nload factor {lf:.2f}x",
+            xy=(max(ws), curves[variant][max(ws)] / 1e6),
+            xytext=(6, 0),
+            textcoords="offset points",
+            color=color,
             fontsize=9,
             va="center",
         )
-    workers_all = sorted({w for pts in curves.values() for w in pts})
-    _style_worker_axis(ax, workers_all)
-    ax.set_ylabel("throughput (thousand tokens/s)")
-    ax.set_title(f"Five ways to split a transformer — throughput ({exp.split('_')[1]})")
-    ax.set_xlim(0.8, max(workers_all) * 1.35)
-    fig.savefig(RESULTS_DIR / "strategies_throughput.png", bbox_inches="tight")
+
+    ws = sorted(curves["ep_uniform"])
+    lost = 1 - curves["ep_skewed"][max(ws)] / curves["ep_uniform"][max(ws)]
+    ax.set_title(
+        f"Expert parallelism: routing decides throughput, not hardware\n"
+        f"{lost:.0%} of throughput lost to imbalance at {max(ws)} devices — "
+        "same FLOPs, same bytes moved"
+    )
+    _style_worker_axis(ax, ws)
+    ax.set_ylabel("throughput (million tokens/s)")
+    ax.set_xlim(0.8, max(ws) * 1.7)
+    fig.savefig(RESULTS_DIR / "expert_imbalance.png", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -351,6 +421,7 @@ def _main() -> None:
         plot_amdahl_t4,
         plot_pipeline_bubble,
         plot_strategies_throughput,
+        plot_expert_imbalance,
         plot_strategies_cost,
     ):
         fn()
