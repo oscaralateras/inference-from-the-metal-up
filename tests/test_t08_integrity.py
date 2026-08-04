@@ -156,6 +156,30 @@ def test_end_to_end_is_smaller_than_the_kernel_speedup() -> None:
     )
 
 
+def test_the_int8_control_reaches_a_higher_share_of_its_byte_ratio_than_int4() -> None:
+    """The dose-response the note's central argument rests on.
+
+    If arithmetic per byte is what binds, int8 — one weight per byte instead of two, so half the
+    work per byte — must land closer to its own byte ratio than int4 does to its. If that ordering
+    ever inverts, the arithmetic explanation is wrong and the note is telling a story the data no
+    longer supports, so this fails rather than letting the prose drift away from the CSV.
+
+    Deliberately an ordering test, not a threshold: the exact shares are hardware-specific, but the
+    direction is what the claim actually predicts.
+    """
+    rows = _skip_unless_measured()
+    int4_share = scalar(rows, "summary", "int4_fused", "kernel_speedup") / scalar(
+        rows, "summary", "int4_fused", "byte_ratio"
+    )
+    int8_share = scalar(rows, "summary", "int4_fused", "int8_speedup") / scalar(
+        rows, "summary", "int4_fused", "int8_byte_ratio"
+    )
+    assert int8_share > int4_share, (
+        f"int8 reached {int8_share:.1%} of its byte ratio and int4 {int4_share:.1%} — the note "
+        "claims int8 does better because it does half the work per byte; that ordering just failed"
+    )
+
+
 def test_accuracy_floor_held() -> None:
     """int4 per-group must hold T1's cosine. Below it, the win is being bought with correctness."""
     rows = _skip_unless_measured()
@@ -167,8 +191,33 @@ def test_accuracy_floor_held() -> None:
 
 
 def _speedups_quoted_in_the_note() -> set[float]:
-    """Every `N.NNx` figure in the lab note — the form all four speedup claims are written in."""
-    return {float(m) for m in re.findall(r"\b(\d+\.\d\d)x\b", NOTE.read_text())}
+    """Every `N.NN×` figure in the lab note — the form all speedup claims are written in.
+
+    **This guard shipped broken and passed for its whole life.** It matched `\\b(\\d+\\.\\d\\d)x\\b`
+    — ASCII `x` — while the note is written with `×` (U+00D7). The regex found nothing, so the
+    assertion below reduced to `not set()` and the test was green regardless of what the note said.
+    It let seven stale headline numbers through a re-measurement.
+
+    Both characters are accepted now, and `_assert_note_uses_a_matchable_form` below fails if the
+    note ever stops containing figures in a form this can see — because a guard that silently
+    matches nothing is worse than no guard, having also consumed the attention a real one would
+    have got.
+    """
+    return {float(m) for m in re.findall(r"\b(\d+\.\d\d)\s*[x×]", NOTE.read_text())}
+
+
+def test_the_headline_guard_can_actually_see_the_note() -> None:
+    """Meta-guard: prove the extractor matches something before trusting it to match everything.
+
+    Without this, any future edit to the note's notation (or to the regex) silently disarms the
+    check below, which is precisely the failure that already happened once.
+    """
+    if "___" in NOTE.read_text():
+        pytest.skip("lab note still has placeholders — fill it in after the run")
+    assert _speedups_quoted_in_the_note(), (
+        "the headline-number guard extracted zero figures from the lab note — the note's notation "
+        "and this regex have diverged, so the guard below is passing vacuously"
+    )
 
 
 def test_lab_note_headline_numbers_come_from_the_results() -> None:
@@ -178,8 +227,10 @@ def test_lab_note_headline_numbers_come_from_the_results() -> None:
     hand. This is the cheap guard that makes that impossible: a re-run that changes the numbers
     fails CI until the note is updated with them.
 
-    Only *measured* speedups are checked. The note also quotes the predicted 3.88x and 2.33x,
-    which are in the results too (`byte_ratio`, `predicted_end_to_end`), so both survive.
+    Only *measured* speedups are checked. The note also quotes the predicted byte ratio and the
+    predicted end-to-end, which are in the results too (`byte_ratio`, `predicted_end_to_end`), so
+    both survive. The int8 control's speedup and byte ratio are included for the same reason: the
+    note now leans on them, so they have to be pinned to the CSV like everything else.
     """
     rows = _skip_unless_measured()
     if "___" in NOTE.read_text():
@@ -187,7 +238,15 @@ def test_lab_note_headline_numbers_come_from_the_results() -> None:
 
     available = {
         round(scalar(rows, "summary", "int4_fused", metric), 2)
-        for metric in ("kernel_speedup", "byte_ratio", "end_to_end_speedup", "predicted_end_to_end")
+        for metric in (
+            "kernel_speedup",
+            "byte_ratio",
+            "end_to_end_speedup",
+            "predicted_end_to_end",
+            "speedup_vs_cublas",
+            "int8_speedup",
+            "int8_byte_ratio",
+        )
     }
     unsupported = {q for q in _speedups_quoted_in_the_note() if q not in available}
     assert not unsupported, (

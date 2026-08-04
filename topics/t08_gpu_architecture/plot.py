@@ -29,14 +29,21 @@ RESULTS_DIR = Path(__file__).parent / "results"
 COLOURS = {
     "bf16_cublas": "#7f7f7f",
     "bf16_triton": "#d62728",
+    "int8_fused": "#1f77b4",
     "int4_fused": "#2ca02c",
 }
 LABELS = {
     "bf16_cublas": "decode, bf16 (cuBLAS — reference)",
     "bf16_triton": "decode, bf16 (Triton — control)",
+    "int8_fused": "decode, int8 (fused Triton — control)",
     "int4_fused": "decode, int4 (fused Triton)",
 }
-MARKERS = {"bf16_cublas": "s", "bf16_triton": "o", "int4_fused": "o"}
+MARKERS = {"bf16_cublas": "s", "bf16_triton": "o", "int8_fused": "^", "int4_fused": "o"}
+
+# Plotted left to right along the roof. int8 sits between the two endpoints and is what turns the
+# figure from a before/after into a trend: three points at 2, 1 and 0.5 bytes per weight, with the
+# achieved throughput flattening as the arithmetic per byte doubles.
+PLOTTED = ("bf16_cublas", "bf16_triton", "int8_fused", "int4_fused")
 
 
 def _roof(profile: HardwareProfile, intensities: list[float]) -> list[float]:
@@ -61,8 +68,8 @@ def plot_moved_point(rows: list[dict[str, str]], profile: HardwareProfile) -> Pa
         label=f"ridge point ({profile.ridge_point:,.0f} FLOPs/byte)",
     )
 
-    points: list[tuple[float, float]] = []
-    for variant in ("bf16_cublas", "bf16_triton", "int4_fused"):
+    coords: dict[str, tuple[float, float]] = {}
+    for variant in PLOTTED:
         ms = scalar(rows, "gemv", variant, "ms")
         moved = scalar(rows, "gemv", variant, "bytes")
         # FLOPs are identical for both variants — same maths, different storage. Only the byte
@@ -70,8 +77,7 @@ def plot_moved_point(rows: list[dict[str, str]], profile: HardwareProfile) -> Pa
         flops = profile_shape_flops(rows)
         intensity = flops / moved
         tflops = flops / (ms * 1e-3) / 1e12
-        if variant != "bf16_cublas":
-            points.append((intensity, tflops))
+        coords[variant] = (intensity, tflops)
         ax.scatter(
             intensity,
             tflops,
@@ -84,7 +90,9 @@ def plot_moved_point(rows: list[dict[str, str]], profile: HardwareProfile) -> Pa
             label=LABELS[variant],
         )
 
-    (x0, y0), (x1, y1) = points
+    # The arrow spans the controlled comparison only — bf16 Triton to int4 Triton, same author and
+    # framework. int8 is drawn as a waypoint on that path rather than an endpoint of it.
+    (x0, y0), (x1, y1) = coords["bf16_triton"], coords["int4_fused"]
     ax.annotate(
         "",
         xy=(x1, y1),

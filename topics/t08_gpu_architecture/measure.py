@@ -389,10 +389,17 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
         f"({share_of_ratio:.0%} of the {pred.byte_ratio:.2f}x byte ratio)"
     )
     print(f"  vs cuBLAS        {speedup_vs_cublas:.2f}x  (practical, not the band)")
+    # Report the int8 control against *its own* byte ratio, not int4's. That share is the whole
+    # point of the control: the same kernel structure scored on the same pre-registered line, so a
+    # reader can see the band flip verdict as the arithmetic per byte halves. Printing only the raw
+    # speedup would bury the comparison the control exists to make.
+    int8_speedup = triton_bf16["ms"] / int8["ms"]
+    int8_ratio = BASELINE_BYTES_PER_PARAM / int8_pool[0].bytes_per_param
+    int8_share = int8_speedup / int8_ratio
     print(
-        f"  int8 control     {triton_bf16['ms'] / int8['ms']:.2f}x at "
-        f"{BASELINE_BYTES_PER_PARAM / int8_pool[0].bytes_per_param:.2f}x fewer bytes "
-        f"— half the work per byte"
+        f"  int8 control     {int8_speedup:.2f}x of a {int8_ratio:.2f}x byte ratio "
+        f"= {int8_share:.0%} -> {_verdict(int8_share, MIN_KERNEL_SHARE_OF_BYTE_RATIO, 1.0)} "
+        f"(int4: {share_of_ratio:.0%})"
     )
     print(f"  cosine vs fp32   {cosine:.4f}")
     print(

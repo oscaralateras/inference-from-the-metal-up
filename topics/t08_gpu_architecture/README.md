@@ -3,7 +3,9 @@
 **Question:** Decode is bandwidth-bound (T7). If I make it read **4× fewer bytes**, do I get 4× the
 tokens — and if not, what ate the difference?
 
-**Setup:** NVIDIA A100-SXM4-80GB, SM 1215 MHz / memory 1593 MHz, torch 2.8.0+cu128, Triton 3.4.0.
+**Setup:** NVIDIA A100-SXM4-80GB, SM 1215 MHz idle / 1410 MHz boost, memory 1593 MHz, torch
+2.8.0+cu128, Triton 3.4.0. **Every "% of roof" below is against the *measured* roof of 1,737 GB/s**
+(`make probe`, shared with T6 and T7), not the 2,039 GB/s datasheet figure — the two are never mixed.
 Qwen2.5-7B's decode MLP up-projection (N=18944, K=3584); as in T7, synthetic weights, because the
 byte budget depends on the shape and not the values. Session `ea734b39914c`, shared with T6 and T7.
 
@@ -13,30 +15,63 @@ byte budget depends on the shape and not the values. Session `ea734b39914c`, sha
 
 ![the decode point moves](results/int4_roofline.png)
 
-**Storing weights in int4 cuts the bytes 3.88× and buys 1.56×.**
+**Storing weights in int4 cuts the bytes 3.88× and buys 1.54×.**
 
-Quantisation does not remove work; it trades one cost for two others. Half the shortfall is that a
-compressed weight is a *shorter read*, and a shorter read gives the memory system less time to reach
-steady state. The other half is the dequantisation arithmetic, which grows exactly as fast as the
-byte count falls. A load-only control — same shape, same bytes, no maths — separates them.
+Quantisation does not remove work; it relocates it. What it takes off the memory system it puts
+onto the vector units, and on this GPU at batch 1 the second cost eats most of the first.
 
 | kernel | bytes / launch | ms | GB/s | % of memory roof |
 |---|---|---|---|---|
-| bf16, cuBLAS (`torch.matmul`) | 135.8 MB | 0.094 | 1,442 | 83.1% |
-| **bf16, Triton** (control) | 135.8 MB | 0.082 | **1,658** | **95.4%** |
-| load-only, same pattern, no arithmetic | 35.0 MB | 0.030 | 1,185 | 68.2% |
-| **int4 fused, Triton** | 35.0 MB | **0.053** | 665 | 38.3% |
+| bf16, cuBLAS (`torch.matmul`) | 135.8 MB | 0.094 | 1,444 | 83.2% |
+| **bf16, Triton** (control) | 135.8 MB | 0.082 | **1,659** | **95.5%** |
+| int8 fused, Triton (control) | 69.0 MB | 0.055 | 1,256 | 72.3% |
+| load-only, int4 pattern, no arithmetic | 35.0 MB | 0.030 | 1,185 | 68.2% |
+| **int4 fused, Triton** | 35.0 MB | **0.053** | 660 | 38.0% |
 
-Median of 5 runs; the int4 spread is 664–666 GB/s.
+Median of 5 runs; the int4 spread is 659–662 GB/s.
 
 | pre-registered band | predicted | measured | verdict |
 |---|---|---|---|
-| kernel ≥ 75% of the byte ratio | 3.88× ceiling | **1.56×** (40%) | **OUTSIDE** ✗ |
+| kernel ≥ 75% of the byte ratio | 3.88× ceiling | **1.54×** (40%) | **OUTSIDE** ✗ |
 | cosine ≥ 0.99 vs fp32 | — | **0.9932** | WITHIN ✓ |
-| end-to-end within ±25% | 2.21× | **1.36×** | **OUTSIDE** ✗ |
+| end-to-end within ±25% | 2.21× | **1.35×** | **OUTSIDE** ✗ |
 
 Two of three bands failed. They are reported as failures, and the mechanism behind them is the
 finding.
+
+### The int8 control is what makes that mechanism a measurement rather than an excuse
+
+A kernel that misses its band has an obvious alternative explanation: the kernel is bad, or the
+harness is. The cheapest way to distinguish "quantisation costs arithmetic" from "Oscar writes slow
+Triton" is to run the *same kernel structure* at a second bit width and see whether the band moves
+with the arithmetic. int8 halves the byte saving and halves the work per byte with it — one byte
+carries one weight, so there is no nibble to unpack and one multiply-accumulate per byte instead of
+two.
+
+| | byte ratio | speedup | **% of its own ceiling** | band |
+|---|---|---|---|---|
+| int8 fused | 1.97× | 1.49× | **75.7%** | **WITHIN ✓** |
+| int4 fused | 3.88× | 1.54× | **39.8%** | OUTSIDE ✗ |
+
+**The same code, the same harness and the same pre-registered 75% line pass at 8 bits and fail at
+4.** A bad kernel or a bad harness would fail both. The band was not miscalibrated; it is int4's
+arithmetic that misses it.
+
+The sharpest form of the result appears when the two integer kernels are normalised to *weights
+processed* rather than bytes moved:
+
+| | GB/s | bytes/weight | **Gweights/s** |
+|---|---|---|---|
+| bf16 Triton | 1,659 | 2.000 | 830 |
+| int8 fused | 1,256 | 1.016 | **1,237** |
+| int4 fused | 660 | 0.516 | **1,281** |
+
+The two integer kernels sit within 3.6% of each other on weights per second while their
+*bandwidths* differ by 1.9×. They are pinned to the same rate — and it is a rate denominated in
+weights, not in bytes. That is the whole topic in one line: **below bf16, this kernel stops being
+limited by how much it reads and starts being limited by how much it must do to each thing it
+reads.** Halving the bits again buys almost nothing, because the binding constraint no longer has
+bits in it.
 
 ### Everything that fed the prediction came from an earlier topic
 
@@ -59,12 +94,12 @@ first is what this topic is about.
 So the control is **the same GEMV in Triton over bf16 weights** — same author, same framework, same
 tiling, same reduction, same reused output buffer. Only the data format differs.
 
-That control also settles a question worth settling: it reaches **95.4% of the memory roof, ahead of
-cuBLAS's 83.1%.** The framework is not the limitation and neither is the kernel structure. Whatever
+That control also settles a question worth settling: it reaches **95.5% of the memory roof, ahead of
+cuBLAS's 83.2%.** The framework is not the limitation and neither is the kernel structure. Whatever
 the int4 kernel loses, it loses to its own arithmetic.
 
 The cuBLAS row stays because "should I ship this?" is a real question with a different answer:
-against what a decode step runs today, the int4 kernel is **1.79×**.
+against what a decode step runs today, the int4 kernel is **1.77×**.
 
 ## The gap has two causes, and only one of them is quantisation
 
@@ -75,20 +110,29 @@ separates them: **same access pattern, same 35 MB, no arithmetic at all — and 
 
 | step | % of roof | cause |
 |---|---|---|
-| bf16 Triton, 135.8 MB/launch | 95.4% | — |
+| bf16 Triton, 135.8 MB/launch | 95.5% | — |
 | load-only, 35.0 MB/launch | 68.2% | **the smaller transfer**, nothing to do with quantisation |
-| int4 fused, 35.0 MB/launch | 38.3% | **the arithmetic** |
+| int4 fused, 35.0 MB/launch | 38.0% | **the arithmetic** |
 
 Roughly half the shortfall is simply that reading a quarter as much per launch gives the memory
 system a quarter as long to reach steady state. That is a real cost of quantisation — a compressed
 weight *is* a shorter read — but it is a different mechanism from the arithmetic, and a kernel that
 merely loaded int4 bytes and threw them away would still not reach 95%.
 
+**The ceiling is a property of the transfer size, not of "loading" in general** — which is worth
+stating because the int8 row appears to violate it. int8 reaches 1,256 GB/s against a load-only
+ceiling of 1,185, and that is not a measurement error: the probe streams the *int4* volume of
+35 MB, while int8 moves 69 MB per launch and therefore amortises ramp-up over twice as long a read.
+Two transfer sizes, two ceilings. The int8 row is a second, independent sighting of the same
+shorter-read effect the probe was built to isolate, and the integrity guard bounds int4 against the
+probe only, because that is the pair the probe actually shares an access pattern with.
+
 The other half is the dequantisation, and the per-byte accounting explains it:
 
 | | weights per byte loaded | work per byte |
 |---|---|---|
 | bf16 | 0.5 | one multiply-accumulate per 2 bytes → **~2 ops/byte** |
+| int8 g128 | 1 | subtract bias, convert, multiply-accumulate → **~4 ops/byte** |
 | int4 g128 | 2 | unpack two nibbles, two multiply-accumulates → **~8 ops/byte** |
 
 **Five structural variants were tried and every one measured within noise**: a wider reduction tile,
@@ -98,14 +142,18 @@ into an fp16 mantissa to remove the integer→float conversion entirely — the 
 kernels use.
 
 Those nulls are **consistent with** an arithmetic-volume limit without proving one. Each removes
-roughly one operation of the eight, which predicts a ~4% change — inside the 664–669 GB/s spread,
-so individually unresolvable. What actually carries the claim is the load-only control above: a
-30-point effect, measured directly.
+roughly one operation of the eight, which predicts a ~4% change — inside the 659–662 GB/s spread,
+so individually unresolvable. What carries the claim is the two controls, both of which move the
+result by far more than the noise: the load-only probe (a 30-point effect on the transfer term) and
+the int8 kernel (a 36-point effect on the arithmetic term, and a band that flips verdict).
 
 **Reading 4× fewer bytes means doing 4× more arithmetic per byte read**, and an A100 has roughly
-**9.6 fp32 vector FLOPs available per byte of bandwidth** (19.5 TFLOP/s against 2,039 GB/s). At ~8
-ops/byte the dequantisation consumes most of that budget, which is why the kernel sits where it
-does against its own load-only ceiling.
+**11.2 fp32 vector FLOPs available per byte of bandwidth** — 19.5 TFLOP/s (6,912 fp32 lanes × 1.41
+GHz boost × 2) against the 1,737 GB/s measured here. At ~8 ops/byte the dequantisation consumes
+most of that budget; at int8's ~4 it does not, which is why int8 clears the band and int4 does not.
+
+That budget is why the two integer kernels converge on ~1.25 Tweights/s: the limit they share is
+the vector-issue rate, and it is indifferent to how many bits each weight was stored in.
 
 The general form of the result: whether quantisation pays on a given GPU depends on that GPU's
 compute-per-byte, and a datacentre part optimised for tensor-core throughput can have far less
@@ -113,7 +161,7 @@ compute-per-byte, and a datacentre part optimised for tensor-core throughput can
 
 ## Where this sits against production kernels
 
-**1.56× is short of what the technique can deliver, and the measurement points at why.** Production
+**1.54× is short of what the technique can deliver, and the measurement points at why.** Production
 int4 kernels — Marlin, AWQ, the GPTQ family — attack precisely the term this topic identifies as
 binding, by two mechanisms:
 
