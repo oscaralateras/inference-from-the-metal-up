@@ -106,12 +106,23 @@ The general form of the result: whether quantisation pays on a given GPU depends
 compute-per-byte, and a datacentre part optimised for tensor-core throughput can have far less
 *general-purpose vector* throughput per byte than the headline figures suggest.
 
-**This is why production int4 kernels are exotic.** Marlin, AWQ and the GPTQ kernels go to
-considerable lengths — bit-stuffing nibbles into fp16 mantissas to dodge the integer→float
-conversion instruction, dequantising directly into tensor-core layouts — and from the outside that
-reads as over-engineering. It isn't. Without it the win evaporates on exactly the hardware people
-deploy on. A naive fused kernel is the right thing to write first, and this is the measurement that
-explains why it is not the thing to ship.
+## Where this sits against production kernels
+
+**1.56× is well short of what the technique can deliver, and the shortfall is implementation, not
+physics.** Marlin and the AWQ/GPTQ kernels reach close to the full byte ratio at batch 1 on this
+class of hardware. So the ceiling is reachable; this kernel does not reach it.
+
+The difference is specific and nameable. Those kernels avoid the integer→float conversion entirely,
+bit-stuffing nibbles into fp16 mantissas so the unpack is a mask and an add rather than a
+conversion instruction, and they dequantise directly into tensor-core layouts so the multiply
+leaves the vector units altogether. That takes the per-byte arithmetic from ~8 operations to
+roughly 1–2 — which is exactly the term this measurement identifies as binding.
+
+Stated plainly because the alternative reading is wrong: **this is not evidence that quantisation
+fails to pay on an A100.** It is a measurement of what a straightforward fused kernel costs, and an
+identification of which cost the production kernels engineer away. A naive fused kernel is the
+right thing to write first and the wrong thing to ship, and the gap between the two is the ~6
+operations per byte above.
 
 ## Why the dequantisation has to live inside the kernel
 
