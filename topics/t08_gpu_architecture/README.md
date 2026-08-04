@@ -91,11 +91,16 @@ The other half is the dequantisation, and the per-byte accounting explains it:
 | bf16 | 0.5 | one multiply-accumulate per 2 bytes → **~2 ops/byte** |
 | int4 g128 | 2 | unpack two nibbles, two multiply-accumulates → **~8 ops/byte** |
 
-**Four structural variants of the kernel — a wider reduction tile, fp16 instead of fp32 arithmetic,
-the zero-point folded out of the inner loop, and single-stream accumulation joining the two nibble
-halves into one reduction — all measured within noise of each other.** That is the evidence that
-this is a limit on arithmetic *volume* rather than on kernel structure: when four independent ways
-of rearranging the work change nothing, the work itself is the constraint.
+**Five structural variants were tried and every one measured within noise**: a wider reduction tile,
+fp16 rather than fp32 arithmetic, the zero-point folded out of the inner loop, single-stream
+accumulation joining the two nibble halves into one reduction, and unpacking by bit-stuffing codes
+into an fp16 mantissa to remove the integer→float conversion entirely — the technique production
+kernels use.
+
+Those nulls are **consistent with** an arithmetic-volume limit without proving one. Each removes
+roughly one operation of the eight, which predicts a ~4% change — inside the 664–669 GB/s spread,
+so individually unresolvable. What actually carries the claim is the load-only control above: a
+30-point effect, measured directly.
 
 **Reading 4× fewer bytes means doing 4× more arithmetic per byte read**, and an A100 has roughly
 **9.6 fp32 vector FLOPs available per byte of bandwidth** (19.5 TFLOP/s against 2,039 GB/s). At ~8
