@@ -35,7 +35,7 @@ from arch_common.results_io import append_rows, read_rows, scalar
 from arch_common.timing import time_op
 from topics.t01_number_representation.metrics import cosine_similarity
 from topics.t07_roofline.shapes import DEFAULT_HIDDEN, DEFAULT_INTERMEDIATE
-from topics.t08_gpu_architecture.kernel import int4_gemv
+from topics.t08_gpu_architecture.kernel import bf16_gemv, int4_gemv
 from topics.t08_gpu_architecture.pack import DEFAULT_GROUP_SIZE, PackedWeight, quantise_and_pack
 
 RESULTS_DIR = Path(__file__).parent / "results"
@@ -176,14 +176,34 @@ def _rotating(count: int) -> Callable[[], int]:
 def benchmark_baseline(
     weights: list[torch.Tensor], x: torch.Tensor, device: torch.device
 ) -> dict[str, float]:
-    """`torch.matmul` over a rotating pool of bf16 weights — what a decode step does today."""
+    """`torch.matmul` over a rotating pool of bf16 weights — the *practical* baseline.
+
+    cuBLAS, in other words: what a decode step actually runs today. Useful for "is this worth
+    shipping", and the wrong control for "does cutting bytes help", because it differs from the
+    int4 kernel in two ways at once — the data format and roughly fifteen points of roof that
+    separate hand-written Triton from NVIDIA's hand-tuned assembly. See `benchmark_bf16_triton`.
+    """
     pool = [w.to(BASELINE_DTYPE) for w in weights]
     xv = x.to(BASELINE_DTYPE)
     nxt = _rotating(len(pool))
-    # torch.matmul allocates its own output; the int4 path is given a reused buffer so that the
-    # two are compared on the kernel, not on the allocator. Noted as a residual asymmetry in the
-    # lab note — it flatters the baseline, which is the safe direction for the claim being made.
     ms = time_op(lambda: pool[nxt()] @ xv, device, inner=LAUNCHES_PER_TIMING)
+    moved = pool[0].numel() * pool[0].element_size()
+    return {"ms": ms, "gbps": moved / (ms * 1e-3) / 1e9, "bytes": float(moved)}
+
+
+def benchmark_bf16_triton(
+    weights: list[torch.Tensor], x: torch.Tensor, device: torch.device
+) -> dict[str, float]:
+    """The same GEMV in Triton over bf16 weights — the *controlled* baseline.
+
+    Same author, same framework, same tiling, same reduction, same reused output buffer. Only the
+    data format differs, so the ratio against the int4 kernel isolates the byte reduction and
+    nothing else. This is the comparison the pre-registered band was always about.
+    """
+    pool = [w.to(BASELINE_DTYPE) for w in weights]
+    nxt = _rotating(len(pool))
+    out = torch.empty(pool[0].shape[0], device=x.device, dtype=torch.float32)
+    ms = time_op(lambda: bf16_gemv(pool[nxt()], x, out=out), device, inner=LAUNCHES_PER_TIMING)
     moved = pool[0].numel() * pool[0].element_size()
     return {"ms": ms, "gbps": moved / (ms * 1e-3) / 1e9, "bytes": float(moved)}
 
@@ -304,6 +324,9 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
     baseline, base_lo, base_hi = repeat_median(
         lambda: benchmark_baseline(pool, x, device), args.repeats
     )
+    triton_bf16, tri_lo, tri_hi = repeat_median(
+        lambda: benchmark_bf16_triton(pool, x, device), args.repeats
+    )
     fused, fused_lo, fused_hi = repeat_median(
         lambda: benchmark_int4(packed_pool, x, device), args.repeats
     )
@@ -315,7 +338,11 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
         measured_y.cpu().numpy().astype("float32"),
     )
 
-    speedup = baseline["ms"] / fused["ms"]
+    # The band is scored against the *controlled* baseline: same framework, same author, only the
+    # data format differs. Scoring against cuBLAS would charge quantisation for the distance
+    # between hand-written Triton and NVIDIA's assembly, which is not what the topic measures.
+    speedup = triton_bf16["ms"] / fused["ms"]
+    speedup_vs_cublas = baseline["ms"] / fused["ms"]
     share_of_ratio = speedup / pred.byte_ratio
     end_to_end = 1.0 / (weight_share / speedup + (1.0 - weight_share))
 
@@ -323,8 +350,9 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
     print(f"{'kernel':<14} {'ms':>9} {'GB/s':>10} {'% of roof':>11} {'spread GB/s':>20}")
     print("-" * 70)
     for name, r, lo, hi in (
-        ("bf16 torch", baseline, base_lo, base_hi),
-        ("int4 fused", fused, fused_lo, fused_hi),
+        ("bf16 cuBLAS", baseline, base_lo, base_hi),
+        ("bf16 Triton", triton_bf16, tri_lo, tri_hi),
+        ("int4 Triton", fused, fused_lo, fused_hi),
     ):
         print(
             f"{name:<14} {r['ms']:>9.3f} {r['gbps']:>10,.1f} "
@@ -335,13 +363,18 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
         f"\n  kernel speedup   {speedup:.2f}x "
         f"({share_of_ratio:.0%} of the {pred.byte_ratio:.2f}x byte ratio)"
     )
+    print(f"  vs cuBLAS        {speedup_vs_cublas:.2f}x  (practical, not the band)")
     print(f"  cosine vs fp32   {cosine:.4f}")
     print(
         f"  implied decode   {end_to_end:.2f}x -> {pred.t6_tokens_per_sec * end_to_end:.1f} tok/s"
     )
 
     rows: list[dict[str, object]] = []
-    for variant, r in (("bf16_torch", baseline), ("int4_fused", fused)):
+    for variant, r in (
+        ("bf16_cublas", baseline),
+        ("bf16_triton", triton_bf16),
+        ("int4_fused", fused),
+    ):
         rows.extend(
             {
                 "session_id": profile.session_id,
@@ -364,6 +397,7 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
         }
         for metric, value in {
             "kernel_speedup": speedup,
+            "speedup_vs_cublas": speedup_vs_cublas,
             "kernel_speedup_min": baseline["ms"] / (fused["ms"] * fused_hi / fused["gbps"]),
             "kernel_speedup_max": baseline["ms"] / (fused["ms"] * fused_lo / fused["gbps"]),
             "byte_ratio": pred.byte_ratio,

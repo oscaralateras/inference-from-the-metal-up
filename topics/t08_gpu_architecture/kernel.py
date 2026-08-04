@@ -226,6 +226,84 @@ def int4_gemv(pw: PackedWeight, x: torch.Tensor, out: torch.Tensor | None = None
     return y
 
 
+if HAS_TRITON:
+
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_N": bn, "BLOCK_J": bj}, num_warps=w, num_stages=s)
+            for bn in _BLOCK_N
+            for bj in (128, 256, 512)
+            for w in _NUM_WARPS
+            for s in _NUM_STAGES
+        ],
+        key=["n", "k"],
+    )
+    @triton.jit
+    def _bf16_gemv_kernel(  # noqa: PLR0913
+        weight_ptr,
+        x_ptr,
+        y_ptr,
+        n,
+        k,
+        stride_wn,
+        stride_wk,
+        BLOCK_N: tl.constexpr,
+        BLOCK_J: tl.constexpr,
+    ):
+        """The same GEMV over bf16 weights: no unpacking, no scales, nothing else different.
+
+        This is the *controlled* baseline. Comparing the int4 kernel against cuBLAS measures two
+        things at once — the byte reduction, and the distance between a hand-written Triton kernel
+        and NVIDIA's hand-tuned assembly. `probe_ceiling` shows the second is worth ~15 points of
+        roof on an A100, which is not a fact about quantisation and should not be charged to it.
+
+        Same author, same framework, same tiling, same reduction. Only the data format differs, so
+        the ratio between the two isolates exactly the thing the topic is about.
+        """
+        pid = tl.program_id(axis=0)
+        offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < n
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+        for k0 in range(0, k, BLOCK_J):
+            offs_k = k0 + tl.arange(0, BLOCK_J)
+            mask_k = offs_k < k
+            w = tl.load(
+                weight_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
+                mask=mask_n[:, None] & mask_k[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            xv = tl.load(x_ptr + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+            acc += tl.sum(w * xv[None, :], axis=1)
+
+        tl.store(y_ptr + offs_n, acc, mask=mask_n)
+
+
+def bf16_gemv(
+    weight: torch.Tensor, x: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """`W @ x` over bf16 weights, in Triton — the controlled baseline for the int4 kernel."""
+    if not HAS_TRITON:
+        raise RuntimeError("Triton is CUDA-only; see the topic README for the GPU setup")
+
+    x = x.contiguous()
+    y = torch.empty(weight.shape[0], device=x.device, dtype=torch.float32) if out is None else out
+
+    def grid(meta: dict[str, int]) -> tuple[int, ...]:
+        return (triton.cdiv(weight.shape[0], meta["BLOCK_N"]),)
+
+    _bf16_gemv_kernel[grid](
+        weight,
+        x,
+        y,
+        weight.shape[0],
+        weight.shape[1],
+        weight.stride(0),
+        weight.stride(1),
+    )
+    return y
+
+
 def int4_gemv_reference(pw: PackedWeight, x: torch.Tensor) -> torch.Tensor:
     """The same computation, unfused, in plain torch — the correctness oracle.
 

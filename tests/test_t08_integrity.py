@@ -51,6 +51,7 @@ T8_METRICS = {
     "predicted_end_to_end",
     "kernel_speedup_min",
     "kernel_speedup_max",
+    "speedup_vs_cublas",
     "share_of_roof",
 }
 

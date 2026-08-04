@@ -23,8 +23,20 @@ from topics.t08_gpu_architecture.measure import CSV_PATH  # noqa: E402
 
 RESULTS_DIR = Path(__file__).parent / "results"
 
-COLOURS = {"bf16_torch": "#d62728", "int4_fused": "#2ca02c"}
-LABELS = {"bf16_torch": "decode, bf16 (torch)", "int4_fused": "decode, int4 (fused Triton)"}
+# The arrow runs between the two *Triton* points, which is the controlled comparison: same author,
+# same framework, only the data format differs. cuBLAS is plotted too, unconnected, because it is
+# the practical reference rather than part of the experiment.
+COLOURS = {
+    "bf16_cublas": "#7f7f7f",
+    "bf16_triton": "#d62728",
+    "int4_fused": "#2ca02c",
+}
+LABELS = {
+    "bf16_cublas": "decode, bf16 (cuBLAS — reference)",
+    "bf16_triton": "decode, bf16 (Triton — control)",
+    "int4_fused": "decode, int4 (fused Triton)",
+}
+MARKERS = {"bf16_cublas": "s", "bf16_triton": "o", "int4_fused": "o"}
 
 
 def _roof(profile: HardwareProfile, intensities: list[float]) -> list[float]:
@@ -50,7 +62,7 @@ def plot_moved_point(rows: list[dict[str, str]], profile: HardwareProfile) -> Pa
     )
 
     points: list[tuple[float, float]] = []
-    for variant in ("bf16_torch", "int4_fused"):
+    for variant in ("bf16_cublas", "bf16_triton", "int4_fused"):
         ms = scalar(rows, "gemv", variant, "ms")
         moved = scalar(rows, "gemv", variant, "bytes")
         # FLOPs are identical for both variants — same maths, different storage. Only the byte
@@ -58,12 +70,14 @@ def plot_moved_point(rows: list[dict[str, str]], profile: HardwareProfile) -> Pa
         flops = profile_shape_flops(rows)
         intensity = flops / moved
         tflops = flops / (ms * 1e-3) / 1e12
-        points.append((intensity, tflops))
+        if variant != "bf16_cublas":
+            points.append((intensity, tflops))
         ax.scatter(
             intensity,
             tflops,
             s=140,
             zorder=5,
+            marker=MARKERS[variant],
             color=COLOURS[variant],
             edgecolor="white",
             linewidth=1.2,
@@ -116,7 +130,7 @@ def profile_shape_flops(rows: list[dict[str, str]]) -> float:
     the bf16 byte count. Deriving it here keeps the plot from needing the shape passed in, and
     means a change to the benchmarked shape cannot leave the plot silently mislabelled.
     """
-    return scalar(rows, "gemv", "bf16_torch", "bytes")
+    return scalar(rows, "gemv", "bf16_triton", "bytes")
 
 
 def main() -> None:
