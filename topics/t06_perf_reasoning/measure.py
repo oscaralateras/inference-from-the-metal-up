@@ -34,7 +34,6 @@ it, badly so at short output lengths.
 from __future__ import annotations
 
 import argparse
-import gc
 import statistics
 import time
 from dataclasses import dataclass
@@ -181,14 +180,6 @@ def measure_step(engine: Any, batch: int, context: int, vocab: int) -> StepResul
     )
 
 
-def shutdown(engine: Any) -> None:
-    """Release the engine's GPU memory so the next configuration can allocate its own."""
-    del engine
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -198,7 +189,28 @@ def main() -> None:
     parser.add_argument("--contexts", type=int, nargs="+", default=list(DEFAULT_CONTEXTS))
     parser.add_argument("--graph-batches", type=int, nargs="+", default=[1, 8, 32])
     parser.add_argument("--max-model-len", type=int, default=DEFAULT_MAX_MODEL_LEN)
+    parser.add_argument(
+        "--mode",
+        default="graphs",
+        choices=["graphs", "eager"],
+        help=(
+            "one engine per process, by design. Tearing an engine down mid-process to build a "
+            "second one is fragile — vLLM's shutdown path pulls in CUDA runtime libraries that "
+            "need not match the installed torch, and a crash there would destroy a completed "
+            "measurement. Run the modes as separate invocations; the results file merges them."
+        ),
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="delete the results file first. Use when the system under test has changed, so "
+        "rows measured against a different stack cannot survive alongside the new ones.",
+    )
     args = parser.parse_args()
+
+    if args.fresh and CSV_PATH.exists():
+        CSV_PATH.unlink()
+        print(f"cleared {CSV_PATH}\n")
 
     profile = load_profile()
     shape = shape_from_model(args.model, torch.finfo(DTYPES[args.dtype]).bits // 8)
@@ -217,64 +229,56 @@ def main() -> None:
             for metric, value in metrics.items()
         )
 
+    cuda_graphs = args.mode == "graphs"
+    variant = "cuda_graphs" if cuda_graphs else "eager"
     print(f"{args.model} on {profile.device_name} ({args.dtype})")
     print(
-        f"stack: vLLM   analytic params {shape.total_params / 1e9:.2f}B, "
+        f"stack: vLLM   CUDA graphs: {'on' if cuda_graphs else 'off'}   "
+        f"analytic params {shape.total_params / 1e9:.2f}B, "
         f"read per token {shape.params_read_per_token / 1e9:.2f}B\n"
     )
 
     engine = build_engine(
-        args.model, args.dtype, cuda_graphs=True, max_model_len=args.max_model_len
+        args.model, args.dtype, cuda_graphs=cuda_graphs, max_model_len=args.max_model_len
     )
 
-    print(f"{'batch':>6} {'tok/s':>12} {'step ms':>9} {'req p50':>10} {'req p99':>10} {'conc':>8}")
-    print("-" * 62)
-    for batch in args.batches:
-        result = measure_step(engine, batch, args.seq_len, shape.vocab_size)
-        record("batching", "cuda_graphs", batch, result.as_metrics())
-        if batch == 1:
-            record("decode", "measured", args.seq_len, result.as_metrics())
-        print(
-            f"{batch:>6} {result.tokens_per_sec:>12,.1f} {result.step_ms:>9.2f} "
-            f"{result.request_p50_ms:>10,.0f} {result.request_p99_ms:>10,.0f} "
-            f"{result.tokens_per_sec * result.step_ms * 1e-3:>8.2f}"
+    if cuda_graphs:
+        header = (
+            f"{'batch':>6} {'tok/s':>12} {'step ms':>9} {'req p50':>10} {'req p99':>10} {'conc':>8}"
         )
+        print(header)
+        print("-" * len(header))
+        for batch in args.batches:
+            result = measure_step(engine, batch, args.seq_len, shape.vocab_size)
+            record("batching", variant, batch, result.as_metrics())
+            if batch == 1:
+                record("decode", "measured", args.seq_len, result.as_metrics())
+            print(
+                f"{batch:>6} {result.tokens_per_sec:>12,.1f} {result.step_ms:>9.2f} "
+                f"{result.request_p50_ms:>10,.0f} {result.request_p99_ms:>10,.0f} "
+                f"{result.tokens_per_sec * result.step_ms * 1e-3:>8.2f}"
+            )
 
-    print(f"\n{'context':>8} {'tok/s':>12} {'step ms':>9} {'kv MB/token':>13}")
-    print("-" * 46)
-    for context in args.contexts:
-        if context + LONG_TOKENS > args.max_model_len:
-            print(f"{context:>8}  skipped — exceeds max_model_len {args.max_model_len:,}")
-            continue
-        result = measure_step(engine, 1, context, shape.vocab_size)
-        record("context", "cuda_graphs", context, result.as_metrics())
-        print(
-            f"{context:>8} {result.tokens_per_sec:>12,.1f} {result.step_ms:>9.2f} "
-            f"{shape.kv_cache_bytes(context) / 1e6:>13,.1f}"
-        )
+        print(f"\n{'context':>8} {'tok/s':>12} {'step ms':>9} {'kv MB/token':>13}")
+        print("-" * 46)
+        for context in args.contexts:
+            if context + LONG_TOKENS > args.max_model_len:
+                print(f"{context:>8}  skipped — exceeds max_model_len {args.max_model_len:,}")
+                continue
+            result = measure_step(engine, 1, context, shape.vocab_size)
+            record("context", variant, context, result.as_metrics())
+            print(
+                f"{context:>8} {result.tokens_per_sec:>12,.1f} {result.step_ms:>9.2f} "
+                f"{shape.kv_cache_bytes(context) / 1e6:>13,.1f}"
+            )
 
-    graphs_on = {
-        batch: measure_step(engine, batch, args.seq_len, shape.vocab_size)
-        for batch in args.graph_batches
-    }
-    shutdown(engine)
-
-    # Same stack, same kernels, same weights — graphs off. The only variable is launch overhead.
-    engine = build_engine(
-        args.model, args.dtype, cuda_graphs=False, max_model_len=args.max_model_len
-    )
-    print(f"\n{'batch':>6} {'graphs ms':>10} {'eager ms':>10} {'overhead ms':>12} {'share':>8}")
-    print("-" * 52)
+    # Measured in both modes, so the pair isolates per-launch overhead with nothing else varying.
+    print(f"\n{'batch':>6} {'step ms':>10}   (graphs {'on' if cuda_graphs else 'off'})")
+    print("-" * 30)
     for batch in args.graph_batches:
-        eager = measure_step(engine, batch, args.seq_len, shape.vocab_size)
-        record("graphs", "eager", batch, eager.as_metrics())
-        record("graphs", "cuda_graphs", batch, graphs_on[batch].as_metrics())
-        overhead = eager.step_ms - graphs_on[batch].step_ms
-        print(
-            f"{batch:>6} {graphs_on[batch].step_ms:>10.2f} {eager.step_ms:>10.2f} "
-            f"{overhead:>12.2f} {overhead / eager.step_ms:>7.1%}"
-        )
-    shutdown(engine)
+        result = measure_step(engine, batch, args.seq_len, shape.vocab_size)
+        record("graphs", variant, batch, result.as_metrics())
+        print(f"{batch:>6} {result.step_ms:>10.2f}")
 
     append_rows(CSV_PATH, rows)
 
