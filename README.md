@@ -26,7 +26,8 @@ compute moves it. Batching is what escapes the wall.*
 
 ## Roadmap
 
-Eleven topics, built in order. Five shipped; the rest are scoped and planned.
+Eleven topics, built in order. Five shipped, two built and awaiting their GPU session;
+the rest are scoped and planned.
 
 | | Topic | Language | Status |
 |---|---|---|---|
@@ -35,8 +36,8 @@ Eleven topics, built in order. Five shipped; the rest are scoped and planned.
 | T3 | Memory hierarchy | C + PyTorch | ✅ shipped |
 | T4 | Concurrency & synchronization | Rust | ✅ shipped |
 | T5 | Parallelism: five ways to split a transformer | Python · 4× GPU | ✅ shipped |
-| T6 | Performance reasoning | Python · GPU | planned |
-| T7 | Roofline model & arithmetic intensity | Python · GPU | planned |
+| T6 | Performance reasoning | Python · GPU | 🔧 built, awaiting GPU run |
+| T7 | Roofline model & arithmetic intensity | Python · GPU | 🔧 built, awaiting GPU run |
 | T8 | GPU architecture (tiled matmul) | Triton · GPU | planned |
 | T9 | Interconnects & multi-device | Python · multi-GPU | planned |
 | T10 | OS & virtual memory | C + Python | planned |
