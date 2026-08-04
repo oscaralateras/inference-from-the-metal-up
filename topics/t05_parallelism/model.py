@@ -227,7 +227,6 @@ def load_block(layer: int = 0, model_id: str = MODEL_ID) -> TransformerBlock:
     n_kv_heads = int(cfg.get("num_key_value_heads", n_heads))
     head_dim = int(cfg.get("head_dim", cfg["hidden_size"] // n_heads))
 
-    path = hf_hub_download(repo_id=model_id, filename="model.safetensors")
     prefix = f"model.layers.{layer}"
     names = {
         "q": f"{prefix}.self_attn.q_proj.weight",
@@ -240,12 +239,30 @@ def load_block(layer: int = 0, model_id: str = MODEL_ID) -> TransformerBlock:
         "attn_norm": f"{prefix}.input_layernorm.weight",
         "mlp_norm": f"{prefix}.post_attention_layernorm.weight",
     }
-    with safe_open(path, framework="pt") as f:
-        available = set(f.keys())
-        missing = [n for n in names.values() if n not in available]
-        if missing:
-            raise KeyError(f"missing tensors in {model_id}: {missing}")
-        p = {k: f.get_tensor(v).float() for k, v in names.items()}
+    # Checkpoints above a few GB are *sharded* across several safetensors files with an index
+    # mapping tensor name -> file. Reading the index and fetching only the shard(s) holding this
+    # one layer means a 7B download is ~4 GB instead of ~15 GB, and it is the difference between
+    # this loader working on a real model and only working on toy ones.
+    shard_of: dict[str, str] = {}
+    try:
+        index = json.loads(
+            Path(
+                hf_hub_download(repo_id=model_id, filename="model.safetensors.index.json")
+            ).read_text()
+        )
+        shard_of = {name: index["weight_map"][name] for name in names.values()}
+    except Exception:  # noqa: BLE001 - single-file checkpoint has no index; that is not an error
+        shard_of = dict.fromkeys(names.values(), "model.safetensors")
+
+    p: dict[str, torch.Tensor] = {}
+    for shard in sorted(set(shard_of.values())):
+        wanted = {k: v for k, v in names.items() if shard_of[v] == shard}
+        with safe_open(hf_hub_download(repo_id=model_id, filename=shard), framework="pt") as f:
+            available = set(f.keys())
+            missing = [n for n in wanted.values() if n not in available]
+            if missing:
+                raise KeyError(f"missing tensors in {model_id} shard {shard}: {missing}")
+            p.update({k: f.get_tensor(v).float() for k, v in wanted.items()})
 
     return TransformerBlock(
         q=p["q"],
