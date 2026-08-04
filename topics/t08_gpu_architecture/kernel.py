@@ -62,8 +62,7 @@ from topics.t08_gpu_architecture.pack import ZERO_OFFSET, PackedWeight, unpack_t
 # The reduction tile is *not* tunable: it is pinned to GROUP_SIZE so that one scale covers the whole
 # tile (see the loop body). Trading that knob away is what let the scale multiply leave the inner
 # sum, and it was worth far more than the tuning freedom it cost.
-_BLOCK_N = (16, 32, 64)
-_GROUPS = (1, 2, 4)
+_BLOCK_N = (32, 64, 128)
 _NUM_WARPS = (4, 8)
 _NUM_STAGES = (2, 3, 4)
 
@@ -72,9 +71,8 @@ if HAS_TRITON:
 
     @triton.autotune(
         configs=[
-            triton.Config({"BLOCK_N": bn, "GROUPS": g}, num_warps=w, num_stages=s)
+            triton.Config({"BLOCK_N": bn}, num_warps=w, num_stages=s)
             for bn in _BLOCK_N
-            for g in _GROUPS
             for w in _NUM_WARPS
             for s in _NUM_STAGES
         ],
@@ -96,26 +94,20 @@ if HAS_TRITON:
         GROUP_SIZE: tl.constexpr,
         ZERO_POINT: tl.constexpr,
         BLOCK_N: tl.constexpr,
-        GROUPS: tl.constexpr,
     ):
         """y[n] = sum_k dequant(packed[n, k]) * x[k], for a block of BLOCK_N rows.
 
-        The reduction tile is a whole number of quantisation groups wide, and that alignment is the
-        decision the kernel turns on. Within a group every weight in a row shares one scale, so the
-        scale is a constant of the inner sum and factors straight out of it::
+        The reduction tile is exactly one quantisation group wide. That is the design decision the
+        whole kernel turns on: within a group every weight in a row shares one scale, so the scale
+        is a constant of the inner sum and factors straight out of it::
 
             sum_j (code * scale * x)  ==  scale * sum_j (code * x)
 
-        Summing per group first and applying the scale to the *group total* costs one multiply per
-        row per group instead of one per element, and one scale load instead of one alongside every
-        element. `GROUPS` then widens the tile without giving any of that back: the sum reshapes to
-        (rows, groups, group_size), reduces the innermost axis, and meets a (rows, groups) tile of
-        scales. More bytes in flight per program, same minimal scale traffic.
-
-        Both levers were found by measurement, in this order: per-element scales gave 37% of the
-        memory roof, factoring them out gave 52%, and widening the tile gave the rest. A kernel this
-        far left of the ridge has nothing to do but wait, so instruction count and loads in flight
-        are exactly what decide whether it reaches the roof.
+        The first form multiplies by the scale once per *element* and must fetch that scale
+        alongside every element. The second multiplies once per *row per group* and fetches one
+        scale per row per group — 128x fewer loads and one fewer multiply in the hot loop, for an
+        identical result. The first version measured 37% of the memory roof; being memory-bound is
+        the goal, and it was nowhere near it.
         """
         pid = tl.program_id(axis=0)
         offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -125,13 +117,10 @@ if HAS_TRITON:
         # which matters is the one that compounds; a 3584-term reduction in bf16 would add a
         # summation error on top of the quantisation error being measured, and confound the two.
         acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        offs_in_group = tl.arange(0, GROUP_SIZE)
 
-        block_j: tl.constexpr = GROUPS * GROUP_SIZE
-        offs_in_tile = tl.arange(0, block_j)
-        offs_in_groups = tl.arange(0, GROUPS)
-
-        for j0 in range(0, half, block_j):
-            offs_j = j0 + offs_in_tile
+        for j0 in range(0, half, GROUP_SIZE):
+            offs_j = j0 + offs_in_group
             mask_j = offs_j < half
             tile_mask = mask_n[:, None] & mask_j[None, :]
 
@@ -154,32 +143,23 @@ if HAS_TRITON:
             x_lo = tl.load(x_ptr + offs_j, mask=mask_j, other=0.0).to(tl.float32)
             x_hi = tl.load(x_ptr + offs_j + half, mask=mask_j, other=0.0).to(tl.float32)
 
-            # Per-group partial sums: (rows, tile) -> (rows, groups, group_size) -> (rows, groups).
-            part_lo = tl.sum(
-                tl.reshape(code_lo * x_lo[None, :], (BLOCK_N, GROUPS, GROUP_SIZE)), axis=2
-            )
-            part_hi = tl.sum(
-                tl.reshape(code_hi * x_hi[None, :], (BLOCK_N, GROUPS, GROUP_SIZE)), axis=2
-            )
-
-            # Column j sits in group j // G; its partner column j + half exactly half // G groups
-            # further on. Pack-time validation guarantees no group straddles the two halves, so
-            # these indices are exact rather than approximately right.
-            groups_lo = j0 // GROUP_SIZE + offs_in_groups
-            groups_hi = (j0 + half) // GROUP_SIZE + offs_in_groups
+            # Because the tile is one group wide, both group indices are loop-invariant *scalars*
+            # rather than vectors, so each is a single load of BLOCK_N values. Column j sits in
+            # group j // G and its partner column j + half exactly `half // G` groups further on;
+            # pack-time validation guarantees no group straddles the two halves.
             scale_lo = tl.load(
-                scales_ptr + offs_n[:, None] * stride_sn + groups_lo[None, :] * stride_sg,
-                mask=mask_n[:, None],
+                scales_ptr + offs_n * stride_sn + (j0 // GROUP_SIZE) * stride_sg,
+                mask=mask_n,
                 other=0.0,
             ).to(tl.float32)
             scale_hi = tl.load(
-                scales_ptr + offs_n[:, None] * stride_sn + groups_hi[None, :] * stride_sg,
-                mask=mask_n[:, None],
+                scales_ptr + offs_n * stride_sn + ((j0 + half) // GROUP_SIZE) * stride_sg,
+                mask=mask_n,
                 other=0.0,
             ).to(tl.float32)
 
-            acc += tl.sum(part_lo * scale_lo, axis=1)
-            acc += tl.sum(part_hi * scale_hi, axis=1)
+            acc += tl.sum(code_lo * x_lo[None, :], axis=1) * scale_lo
+            acc += tl.sum(code_hi * x_hi[None, :], axis=1) * scale_hi
 
         tl.store(y_ptr + offs_n, acc, mask=mask_n)
 
