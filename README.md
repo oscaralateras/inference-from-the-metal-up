@@ -20,15 +20,15 @@ compute moves it. Batching is what escapes the wall.*
 |---|-------|------------------|------------------|
 | [T1](topics/t01_number_representation) | Number representation & quantization | Granularity is worth ~2–3 bits. Per-tensor int4 loses **71%** of the layer output (cos 0.79); per-group holds **11%** (cos 0.99). | Why production int4 needs per-group scales — and why GPTQ/AWQ exist. One outlier sets the scale for all 885k weights. |
 | [T2](topics/t02_cpu_pipeline) | CPU execution & the pipeline | Fitting the pipeline is worth **1.8×–3.2×** on identical arithmetic: branch 1.76×, ILP 3.20×, SIMD 2.35×. | Decode lands on the wrong side of all three. The serial token dependency is why batching exists. |
-| [T3](topics/t03_memory_hierarchy) | Memory hierarchy & the memory wall | Traversal order is worth **~20×** — and the memory-bound crossover is set by the device's **ridge point**, not by the kernel. | Decode is memory-bound *specifically on GPUs* (ridge ≈ 200 vs CPU ≈ 0.18). Batching raises arithmetic intensity; that is continuous batching's whole lever. |
+| [T3](topics/t03_memory_hierarchy) | Memory hierarchy & the memory wall | Traversal order is worth **~20×** — and the memory-bound crossover is set by the device's **ridge point**, not by the kernel. | Decode is memory-bound *specifically on GPUs* (T4 ridge ≈ 200 vs CPU ≈ 0.18; T7 measures 152 on an A100). Batching raises arithmetic intensity; that is continuous batching's whole lever. |
 | [T4](topics/t04_concurrency) | Concurrency & synchronization | Coordination taxes, all on identical work: memory layout alone **17×**, an unsynchronised counter is **78% wrong**, a locked queue costs **456×** vs sharding. | A single-lock scheduler caps tokens/sec no matter how much GPU you attach. Real engines shard dispatch — this is why. |
 | [T5](topics/t05_parallelism) | Parallelism: five ways to split a transformer | Scaling order is **not** communication order. On 4× A100 NVLink: DP **3.77×** (0 MB/step), TP **2.96×** (940 MB), PP **2.48×** (59 MB). PP is capped by its bubble at 2.91× before a byte moves; TP's bandwidth is only ~4% of its step. Routing skew alone costs EP **55%**. | Communication *volume* doesn't predict communication *cost*, let alone scaling. And DP/SP scale best while replicating the whole model — so neither can serve one that doesn't fit. |
+| [T6](topics/t06_perf_reasoning) | Performance reasoning | A 7B decodes at **94 tok/s** on an A100 and **77% of every step is reading weights**; the KV cache is 0.2%. Effective decode bandwidth is **1,337 GB/s = 77%** of a streaming copy. CUDA graphs are worth **34–46%** of the step, and the loss *grows* with batch. | `0.77 × bandwidth / bytes_per_token` predicts decode within 30%. Batch to ~32–64, not to memory: batch 256 buys 50% more throughput for 166% more tail latency. |
 | [T7](topics/t07_roofline) | Roofline model & arithmetic intensity | Decode runs at **0.5%** of an A100's compute — and that is near-optimal, not wasteful: it hits **82%** of the *memory* roof it is actually under. Batching walks it from 1 to 236 FLOPs/byte, **×105 throughput to batch 128**, then **×1.04** to 256 once it crosses the ridge at 152. | Decode is memory-bound by two orders of magnitude, so quantisation (which raises intensity) beats buying FLOP/s. Batch until the ridge; the ceiling is knowable before you run anything. |
 
 ## Roadmap
 
-Eleven topics, built in order. Five shipped, two built and awaiting their GPU session;
-the rest are scoped and planned.
+Eleven topics, built in order. Seven shipped; the rest are scoped and planned.
 
 | | Topic | Language | Status |
 |---|---|---|---|
@@ -37,7 +37,7 @@ the rest are scoped and planned.
 | T3 | Memory hierarchy | C + PyTorch | ✅ shipped |
 | T4 | Concurrency & synchronization | Rust | ✅ shipped |
 | T5 | Parallelism: five ways to split a transformer | Python · 4× GPU | ✅ shipped |
-| T6 | Performance reasoning | Python · GPU | 🔧 built, awaiting GPU run |
+| T6 | Performance reasoning | Python · GPU | ✅ shipped |
 | T7 | Roofline model & arithmetic intensity | Python · GPU | ✅ shipped |
 | T8 | GPU architecture (tiled matmul) | Triton · GPU | planned |
 | T9 | Interconnects & multi-device | Python · multi-GPU | planned |

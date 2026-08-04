@@ -26,11 +26,11 @@ That distinction — "underutilised" versus "memory-bound" — is the entire rea
 | | measured | A100 spec | achieved |
 |---|---|---|---|
 | memory bandwidth | **1,734.8 GB/s** | 2,039 | 85% |
-| compute (bf16) | **263.6 TFLOP/s** | 312 | 85% |
+| compute (bf16) | **263.6 TFLOP/s** | 312 | 84% |
 | **ridge point** | **152.0 FLOPs/byte** | | |
 
-Both ceilings land at 85% of the marketing figure. Quoting the spec sheet would have shifted every
-conclusion by the same 15%.
+Both ceilings land within a point of 85% of the marketing figure. Quoting the spec sheet would
+have shifted every conclusion by the same 15%.
 
 Peak is also strongly **shape**-dependent, which is why the whole sweep is reported:
 
@@ -103,8 +103,8 @@ runs out at a point the hardware fixes in advance.
 - **The implied-bandwidth column was an afterthought** and turned out to be the strongest evidence
   in the topic — a flat ~1,410 GB/s across six batch sizes says "bandwidth-saturated" far more
   convincingly than any single point could.
-- **Both ceilings landing at exactly 85% of spec** is a coincidence, but a useful one for
-  remembering roughly what a datasheet is worth.
+- **Both ceilings landing within a point of 85% of spec** (85% and 84%) is a coincidence, but a
+  useful one for remembering roughly what a datasheet is worth.
 - **The GEMM sweep spans 5.2×.** I expected shape sensitivity; I did not expect the small end to be
   under a fifth of the large end.
 
@@ -151,6 +151,26 @@ Both read their ceilings from the same `results/hardware.json`, so the two notes
 quoting different roofs for the same GPU. `tests/test_distinctness.py` fails CI if the metric
 vocabularies overlap, if either topic strays into the other's domain, or if the two were measured
 in different sessions.
+
+### The kernels predict the whole model to 0.3%
+
+T7's two decode measurements are of **isolated synthetic tensors** — no model, no cache, no
+scheduler. Weight them by their share of what a real decode step reads:
+
+| kernel class | share of weights read | T7 measured |
+|---|---|---|
+| wide-N (MLP 18944, LM head 152064) | 88.4% | 1,420 GB/s |
+| narrow-N (attention 3584, K/V 512) | 11.6% | 744 GB/s |
+| **weighted prediction** | | **1,341 GB/s** |
+| **T6 measured, whole model, wall-clock** | | **1,337 GB/s** |
+
+**0.31% apart.** A synthetic-kernel benchmark and a production inference engine, agreeing on the
+same physical quantity from opposite directions.
+
+Treat that as order-of-magnitude confirmation rather than precision: a two-bucket model of a
+transformer's matmuls does not deserve three significant figures, and the tightness here is partly
+luck. `tests/test_distinctness.py` enforces the check at a deliberately loose 15%, so it keeps
+catching a genuinely broken topic without failing on the next model or GPU.
 
 The two batch sweeps are the one genuine near-collision, and they measure different things on
 purpose: **T7 sweeps the matmul shape in isolation** — no model, no cache, pure kernel. **T6 sweeps
