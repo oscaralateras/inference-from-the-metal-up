@@ -16,8 +16,15 @@ dependencies = [
     # compatibility), so this is the portable pin, not the conservative one.
     "torch==2.8.0",
     "safetensors>=0.8.0",
-    "huggingface-hub>=1.23.0",
-    "transformers>=4.57.0",
+    # Held below 1.0 because transformers 4.57.x requires it — see the transformers pin. The two
+    # move together, so pinning one without the other just relocates the conflict.
+    "huggingface-hub>=0.34,<1.0",
+    # Upper-bounded deliberately. transformers 5.x removed `all_special_tokens_extended`, which
+    # vLLM 0.11 calls during tokenizer init — yet vLLM declares only `transformers>=4.55.2`, so its
+    # own metadata does not stop the break. An unbounded pin here resolved 5.14.1 and T6 failed
+    # before the engine finished starting. Same class of bug as the torch pin: a floor without a
+    # ceiling is not a pin.
+    "transformers>=4.57,<5",
     # T8's kernel. Pinned directly rather than left to resolve transitively through torch: Triton's
     # codegen and autotuner change between minors, so a floating version would make the kernel's
     # numbers irreproducible. CUDA-only, hence the marker — it is absent on the authoring Mac, and
