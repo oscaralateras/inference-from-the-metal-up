@@ -77,13 +77,16 @@ def plot_moved_point(rows: list[dict[str, str]], profile: HardwareProfile) -> Pa
         xytext=(x0, y0),
         arrowprops={"arrowstyle": "->", "lw": 1.6, "color": "#555555", "shrinkA": 9, "shrinkB": 9},
     )
+    # Offset below-right of the connecting arrow rather than centred on it: at these coordinates
+    # the arrow runs diagonally through the midpoint, and centred text lands on top of it.
     ax.text(
-        (x0 * x1) ** 0.5,
-        (y0 * y1) ** 0.5,
-        f"  {x1 / x0:.1f}x fewer bytes",
+        (x0 * x1) ** 0.5 * 1.35,
+        (y0 * y1) ** 0.5 * 0.72,
+        f"{x1 / x0:.1f}× fewer bytes",
         fontsize=9,
         color="#555555",
-        va="bottom",
+        va="top",
+        ha="left",
     )
 
     ax.set_xscale("log")
