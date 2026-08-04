@@ -88,6 +88,7 @@ if HAS_TRITON:
         packed_ptr,
         scales_ptr,
         x_ptr,
+        xsum_ptr,
         y_ptr,
         n,
         k,
@@ -140,8 +141,9 @@ if HAS_TRITON:
             # A @triton.jit function cannot close over ordinary Python globals — it compiles an AST
             # in isolation and only constexpr arguments cross that boundary. Passing it in keeps
             # `pack.ZERO_OFFSET` the single definition while satisfying the compiler.
-            code_lo = (byte & 0x0F).to(tl.float32) - ZERO_POINT
-            code_hi = (byte >> 4).to(tl.float32) - ZERO_POINT
+            # Raw nibbles, *not* zero-point corrected — see the accumulate below.
+            code_lo = (byte & 0x0F).to(tl.float32)
+            code_hi = (byte >> 4).to(tl.float32)
 
             # x is tiny (K floats) and every program reads all of it, so it lands in L2 after the
             # first program touches it and costs essentially no HBM traffic.
@@ -163,8 +165,20 @@ if HAS_TRITON:
                 other=0.0,
             ).to(tl.float32)
 
-            acc += tl.sum(code_lo * x_lo[None, :], axis=1) * scale_lo
-            acc += tl.sum(code_hi * x_hi[None, :], axis=1) * scale_hi
+            # The zero-point leaves the inner loop, exactly:
+            #
+            #     sum_j (c_j - Z) * x_j  ==  sum_j c_j * x_j  -  Z * sum_j x_j
+            #
+            # and `sum_j x_j` over a group is identical for every row, so it is precomputed once on
+            # the host into `xsum_ptr` and read here as a scalar. That removes one subtract per
+            # *element* — with 68M weights per matrix, even the cheapest instruction runs 68M times.
+            # Groups are always complete (pack-time validation forces GROUP_SIZE to divide both K
+            # and K/2), so the correction never applies to a partially-masked group.
+            xsum_lo = tl.load(xsum_ptr + (j0 // GROUP_SIZE))
+            xsum_hi = tl.load(xsum_ptr + ((j0 + half) // GROUP_SIZE))
+
+            acc += (tl.sum(code_lo * x_lo[None, :], axis=1) - ZERO_POINT * xsum_lo) * scale_lo
+            acc += (tl.sum(code_hi * x_hi[None, :], axis=1) - ZERO_POINT * xsum_hi) * scale_hi
 
         tl.store(y_ptr + offs_n, acc, mask=mask_n)
 
@@ -190,9 +204,14 @@ def int4_gemv(pw: PackedWeight, x: torch.Tensor) -> torch.Tensor:
     if not pw.packed.is_cuda:
         raise ValueError("packed weight must live on a CUDA device")
 
-    x = x.contiguous()
+    x = x.contiguous().to(torch.float32)
     y = torch.empty(pw.n, device=x.device, dtype=torch.float32)
     half = pw.k // 2
+
+    # Per-group sums of x, for the zero-point correction the kernel factors out of its inner loop.
+    # K/GROUP_SIZE values — negligible next to the weights, and computed once per call rather than
+    # once per weight.
+    xsum = x.view(pw.k // pw.group_size, pw.group_size).sum(dim=1).contiguous()
 
     def grid(meta: dict[str, int]) -> tuple[int, ...]:
         return (triton.cdiv(pw.n, meta["BLOCK_N"]),)
@@ -201,6 +220,7 @@ def int4_gemv(pw: PackedWeight, x: torch.Tensor) -> torch.Tensor:
         pw.packed,
         pw.scales,
         x,
+        xsum,
         y,
         pw.n,
         pw.k,
