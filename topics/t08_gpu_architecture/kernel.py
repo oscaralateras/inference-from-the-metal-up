@@ -29,12 +29,14 @@ axis. Rows are independent, so there is no cross-program communication and no at
 parallelism is simply `N / BLOCK_N` programs, and with N in the tens of thousands that is ample to
 fill every SM.
 
-Known inefficiency, left in deliberately and reported in the lab note: scales are loaded per
-element rather than per group, so each group's scale is fetched `GROUP_SIZE` times. Those hits are
-served by L1/L2 rather than HBM, so they cost latency and instructions but almost no bandwidth —
-and bandwidth is the budget this kernel is measured against. Hoisting the load is a real
-optimisation; it is also the kind that makes a kernel harder to read for a win the byte budget
-barely notices, so it stays a stretch item rather than an unexplained complication.
+**A wrong call, corrected by measurement.** The first version loaded a scale alongside every
+weight. The reasoning was that those hits are served by L1/L2 rather than HBM, so they cost
+latency and instructions but almost no *bandwidth* — and bandwidth is the budget. That is true and
+it is beside the point: a kernel this far left of the ridge has nothing to do but wait, so latency
+and instruction count are exactly what decide whether it reaches the roof. It measured 37% of the
+memory roof — comfortably overhead-bound, and therefore not measuring the thing the topic exists
+to measure. Pinning the tile to one quantisation group let the scale multiply leave the inner sum
+entirely. See the kernel docstring for the algebra.
 """
 
 from __future__ import annotations
@@ -53,20 +55,26 @@ except ImportError:  # pragma: no cover
 
 from topics.t08_gpu_architecture.pack import ZERO_OFFSET, PackedWeight, unpack_to_dense
 
-# Autotune space. BLOCK_N trades occupancy against per-program work; BLOCK_J sets how much of the
-# reduction axis is in flight at once, which is what gives the scheduler enough independent loads
-# to hide HBM latency behind. Deliberately small — a wide search costs pod minutes and the roofline
-# says the achievable spread here is narrow.
-_CONFIGS = [(32, 128), (64, 128), (64, 256), (128, 128), (128, 256)]
+# Autotune space. BLOCK_N trades occupancy against per-program work; `num_stages` controls how many
+# loop iterations Triton keeps in flight, which is the actual latency-hiding lever in a loop this
+# memory-bound — a stage count of 1 leaves every warp waiting on its own load.
+#
+# The reduction tile is *not* tunable: it is pinned to GROUP_SIZE so that one scale covers the whole
+# tile (see the loop body). Trading that knob away is what let the scale multiply leave the inner
+# sum, and it was worth far more than the tuning freedom it cost.
+_BLOCK_N = (32, 64, 128)
+_NUM_WARPS = (4, 8)
+_NUM_STAGES = (2, 3, 4)
 
 
 if HAS_TRITON:
 
     @triton.autotune(
         configs=[
-            triton.Config({"BLOCK_N": bn, "BLOCK_J": bj}, num_warps=w)
-            for bn, bj in _CONFIGS
-            for w in (4, 8)
+            triton.Config({"BLOCK_N": bn}, num_warps=w, num_stages=s)
+            for bn in _BLOCK_N
+            for w in _NUM_WARPS
+            for s in _NUM_STAGES
         ],
         key=["n", "k"],
     )
@@ -86,9 +94,21 @@ if HAS_TRITON:
         GROUP_SIZE: tl.constexpr,
         ZERO_POINT: tl.constexpr,
         BLOCK_N: tl.constexpr,
-        BLOCK_J: tl.constexpr,
     ):
-        """y[n] = sum_k dequant(packed[n, k]) * x[k], for a block of BLOCK_N rows."""
+        """y[n] = sum_k dequant(packed[n, k]) * x[k], for a block of BLOCK_N rows.
+
+        The reduction tile is exactly one quantisation group wide. That is the design decision the
+        whole kernel turns on: within a group every weight in a row shares one scale, so the scale
+        is a constant of the inner sum and factors straight out of it::
+
+            sum_j (code * scale * x)  ==  scale * sum_j (code * x)
+
+        The first form multiplies by the scale once per *element* and must fetch that scale
+        alongside every element. The second multiplies once per *row per group* and fetches one
+        scale per row per group — 128x fewer loads and one fewer multiply in the hot loop, for an
+        identical result. The first version measured 37% of the memory roof; being memory-bound is
+        the goal, and it was nowhere near it.
+        """
         pid = tl.program_id(axis=0)
         offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_n = offs_n < n
@@ -97,9 +117,10 @@ if HAS_TRITON:
         # which matters is the one that compounds; a 3584-term reduction in bf16 would add a
         # summation error on top of the quantisation error being measured, and confound the two.
         acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        offs_in_group = tl.arange(0, GROUP_SIZE)
 
-        for j0 in range(0, half, BLOCK_J):
-            offs_j = j0 + tl.arange(0, BLOCK_J)
+        for j0 in range(0, half, GROUP_SIZE):
+            offs_j = j0 + offs_in_group
             mask_j = offs_j < half
             tile_mask = mask_n[:, None] & mask_j[None, :]
 
@@ -117,29 +138,28 @@ if HAS_TRITON:
             code_lo = (byte & 0x0F).to(tl.float32) - ZERO_POINT
             code_hi = (byte >> 4).to(tl.float32) - ZERO_POINT
 
-            # Column j sits in group j // G; its partner column j + half sits G-groups further on.
-            # `half` is required to be a multiple of GROUP_SIZE (enforced at pack time), so no
-            # group ever straddles the two halves and this index is exact.
-            group_lo = offs_j // GROUP_SIZE
-            group_hi = (offs_j + half) // GROUP_SIZE
-            scale_lo = tl.load(
-                scales_ptr + offs_n[:, None] * stride_sn + group_lo[None, :] * stride_sg,
-                mask=tile_mask,
-                other=0.0,
-            ).to(tl.float32)
-            scale_hi = tl.load(
-                scales_ptr + offs_n[:, None] * stride_sn + group_hi[None, :] * stride_sg,
-                mask=tile_mask,
-                other=0.0,
-            ).to(tl.float32)
-
             # x is tiny (K floats) and every program reads all of it, so it lands in L2 after the
             # first program touches it and costs essentially no HBM traffic.
             x_lo = tl.load(x_ptr + offs_j, mask=mask_j, other=0.0).to(tl.float32)
             x_hi = tl.load(x_ptr + offs_j + half, mask=mask_j, other=0.0).to(tl.float32)
 
-            acc += tl.sum(code_lo * scale_lo * x_lo[None, :], axis=1)
-            acc += tl.sum(code_hi * scale_hi * x_hi[None, :], axis=1)
+            # Because the tile is one group wide, both group indices are loop-invariant *scalars*
+            # rather than vectors, so each is a single load of BLOCK_N values. Column j sits in
+            # group j // G and its partner column j + half exactly `half // G` groups further on;
+            # pack-time validation guarantees no group straddles the two halves.
+            scale_lo = tl.load(
+                scales_ptr + offs_n * stride_sn + (j0 // GROUP_SIZE) * stride_sg,
+                mask=mask_n,
+                other=0.0,
+            ).to(tl.float32)
+            scale_hi = tl.load(
+                scales_ptr + offs_n * stride_sn + ((j0 + half) // GROUP_SIZE) * stride_sg,
+                mask=mask_n,
+                other=0.0,
+            ).to(tl.float32)
+
+            acc += tl.sum(code_lo * x_lo[None, :], axis=1) * scale_lo
+            acc += tl.sum(code_hi * x_hi[None, :], axis=1) * scale_hi
 
         tl.store(y_ptr + offs_n, acc, mask=mask_n)
 
