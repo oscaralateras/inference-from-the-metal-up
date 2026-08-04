@@ -22,7 +22,9 @@ so the run can only confirm or embarrass it.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -130,21 +132,53 @@ def predict(
     )
 
 
+# How far the rotating weight pool must exceed L2 before a "streaming" measurement is honest.
+# Timing one weight repeatedly leaves it resident in L2 and measures cache bandwidth: on a 4090
+# (75.5 MB L2) the 35 MB int4 weight fits entirely, and the bf16 baseline was measured at 112% of
+# the HBM roof — impossible, and the tell that the number was wrong. An A100's 40 MB L2 swallows
+# the int4 weight too, so this is not a quirk of the development GPU.
+L2_HEADROOM = 4
+
+
+def _pool_size(device: torch.device, smallest_bytes: int) -> int:
+    """How many distinct weights to rotate through so even the smallest never stays cached.
+
+    Sized against the *int4* footprint because it is the smaller of the two and therefore the
+    easier one to accidentally serve from L2. This also happens to be the physically faithful
+    setup: a real decode step reads every layer's weights once and reuses none of them within a
+    token, so rotating distinct tensors is what the hardware actually sees.
+    """
+    if device.type != "cuda":
+        return 2
+    l2_bytes = torch.cuda.get_device_properties(device).L2_cache_size
+    return max(2, -(-L2_HEADROOM * l2_bytes // smallest_bytes))
+
+
+def _rotating(count: int) -> Callable[[], int]:
+    """Round-robin index generator, so each timed iteration touches a different tensor."""
+    counter = itertools.count()
+    return lambda: next(counter) % count
+
+
 def benchmark_baseline(
-    weight: torch.Tensor, x: torch.Tensor, device: torch.device
+    weights: list[torch.Tensor], x: torch.Tensor, device: torch.device
 ) -> dict[str, float]:
-    """`torch.matmul` on the bf16 weight — what a decode step does today."""
-    w = weight.to(BASELINE_DTYPE)
+    """`torch.matmul` over a rotating pool of bf16 weights — what a decode step does today."""
+    pool = [w.to(BASELINE_DTYPE) for w in weights]
     xv = x.to(BASELINE_DTYPE)
-    ms = time_op(lambda: w @ xv, device)
-    moved = w.numel() * w.element_size()
+    nxt = _rotating(len(pool))
+    ms = time_op(lambda: pool[nxt()] @ xv, device)
+    moved = pool[0].numel() * pool[0].element_size()
     return {"ms": ms, "gbps": moved / (ms * 1e-3) / 1e9, "bytes": float(moved)}
 
 
-def benchmark_int4(pw: PackedWeight, x: torch.Tensor, device: torch.device) -> dict[str, float]:
-    """The fused kernel. Bytes counted off the packed tensors, scales included."""
-    ms = time_op(lambda: int4_gemv(pw, x), device)
-    moved = pw.bytes_stored
+def benchmark_int4(
+    packed: list[PackedWeight], x: torch.Tensor, device: torch.device
+) -> dict[str, float]:
+    """The fused kernel, over the same rotating pool. Bytes counted off the packed tensors."""
+    nxt = _rotating(len(packed))
+    ms = time_op(lambda: int4_gemv(packed[nxt()], x), device)
+    moved = packed[0].bytes_stored
     return {"ms": ms, "gbps": moved / (ms * 1e-3) / 1e9, "bytes": float(moved)}
 
 
@@ -164,6 +198,12 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
         action="store_true",
         help="print the prediction and exit — no GPU or Triton required",
     )
+    parser.add_argument(
+        "--layers",
+        type=int,
+        default=0,
+        help="distinct weights to rotate through (0 = size it from the GPU's L2)",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -177,6 +217,7 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
 
     pw = quantise_and_pack(weight, args.group_size)
     weight_share, t6_tps = _t6_weight_share()
+    pool_size = args.layers or _pool_size(device, pw.bytes_stored)
 
     # The profile is loaded *before* the prediction is written, not after the kernel runs, so the
     # session stamped into predictions.json is provably the one the kernel is about to be measured
@@ -207,10 +248,24 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
         print(f"prediction written to {PREDICTIONS_PATH}; skipping the kernel")
         return
 
-    print(f"{profile.device_name}  |  measured roof {profile.peak_bandwidth_gbps:,.1f} GB/s\n")
+    l2_mb = (
+        torch.cuda.get_device_properties(device).L2_cache_size / 1e6 if device.type == "cuda" else 0
+    )
+    print(f"{profile.device_name}  |  measured roof {profile.peak_bandwidth_gbps:,.1f} GB/s")
+    print(
+        f"rotating {pool_size} distinct weights "
+        f"({pool_size * pw.bytes_stored / 1e6:,.0f} MB int4 against {l2_mb:,.0f} MB of L2)\n"
+    )
 
-    baseline = benchmark_baseline(weight, x, device)
-    fused = benchmark_int4(pw, x, device)
+    # Distinct tensors, not copies — a decode step reads every layer once and reuses none of them,
+    # and one tensor timed repeatedly would sit in L2 and report cache bandwidth as if it were HBM.
+    pool = [weight] + [
+        torch.randn(n, k, device=device, dtype=torch.float32) * 0.02 for _ in range(pool_size - 1)
+    ]
+    packed_pool = [pw] + [quantise_and_pack(w, args.group_size) for w in pool[1:]]
+
+    baseline = benchmark_baseline(pool, x, device)
+    fused = benchmark_int4(packed_pool, x, device)
 
     reference = (weight @ x).to(torch.float32)
     measured_y = int4_gemv(pw, x)
