@@ -1,0 +1,10 @@
+{
+  "bytes_per_param_bf16": 2.0,
+  "bytes_per_param_int4": 0.515625,
+  "byte_ratio": 3.878787878787879,
+  "weight_share": 0.7689286127042699,
+  "predicted_end_to_end": 2.3293148251670597,
+  "t6_tokens_per_sec": 94.33356701098664,
+  "predicted_tokens_per_sec": 219.73257614958146,
+  "session_id": ""
+}

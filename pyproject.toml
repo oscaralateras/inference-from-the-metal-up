@@ -12,6 +12,11 @@ dependencies = [
     "safetensors>=0.8.0",
     "huggingface-hub>=1.23.0",
     "transformers>=4.57.0",
+    # T8's kernel. Pinned directly rather than left to resolve transitively through torch: Triton's
+    # codegen and autotuner change between minors, so a floating version would make the kernel's
+    # numbers irreproducible. CUDA-only, hence the marker — it is absent on the authoring Mac, and
+    # `kernel.py` degrades to an import guard there.
+    "triton>=3.7,<3.8 ; sys_platform == 'linux'",
 ]
 
 [dependency-groups]
