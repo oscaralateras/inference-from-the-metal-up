@@ -8,23 +8,17 @@
 # checker that *can* resolve triton — which is why this only surfaced on the GPU pod, not the Mac.
 """What can this access pattern reach with no arithmetic at all?
 
-This probe exists because it is the measurement that broke a wrong debugging loop, and a claim that
-load-bearing does not belong in a throwaway script.
+Strip the kernel to loads and a trivial sum — no unpacking, no scale, no `x` — and measure the same
+tiles, from the same rotating pool, at the same shapes. What is left is the access pattern alone.
 
-The fused kernel measured 49% of the memory roof, and three rounds of optimisation aimed at its
-arithmetic made it worse or did nothing. The question nobody had asked was whether the *access
-pattern* could go faster at all. So: strip the kernel to loads and a trivial sum — no unpacking, no
-scale, no `x` — and measure the same tiles, from the same rotating pool, at the same shapes.
+That number separates two questions the full kernel conflates: *can these bytes be delivered faster*
+and *is the arithmetic on top of them too expensive*. Without it, a kernel below the roof is simply
+"slow", with no way to tell which half to work on. It also reports the best tile shape for the
+pattern, which is what motivated making the tile an autotune dimension rather than a constant.
 
-It reaches ~93% of the roof. That single number relocated the entire problem: the memory path was
-already near-saturated, so whatever was costing 44 points was not the loads and not the maths, and
-attention moved to everything *around* the kernel. It was the harness — a fresh output allocation
-inside the timed region, and single cold launches for a 40 microsecond kernel.
-
-**Rotation is not optional here.** An earlier version of this probe used one tensor and reported
-1,031 GB/s — 110% of roof, which is impossible for HBM and is the signature of an L2-resident
-working set. The int4 weight is 35 MB against a 4090's 75.5 MB of L2 and an A100's 40 MB, so it
-fits entirely in cache on both. The probe that produced the useful answer is the one that streams.
+**Rotation is not optional.** Timing one tensor repeatedly reports cache bandwidth as if it were
+HBM: the int4 weight is 35 MB against an A100's 42 MB of L2, so it fits entirely in cache, and the
+probe would report ~110% of roof — impossible for HBM, and the signature of exactly that mistake.
 
     python -m topics.t08_gpu_architecture.probe_ceiling
 """

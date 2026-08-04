@@ -2,9 +2,9 @@
 
 **Question:** Where do real inference matmuls sit on my GPU's roofline, and what moves them?
 
-**Setup:** NVIDIA A100-SXM4-80GB, bfloat16, SM clock 1230 MHz / memory 1593 MHz, torch 2.8.0+cu128.
+**Setup:** NVIDIA A100-SXM4-80GB, bfloat16, SM clock 1215 MHz / memory 1593 MHz, torch 2.8.0+cu128.
 Qwen2.5-7B's dimensions (hidden 3584, intermediate 18944); **no weights are ever loaded** — every
-measurement is a synthetic tensor of the right shape. Session `6c79f20d6c13`, shared with T6.
+measurement is a synthetic tensor of the right shape. Session `ea734b39914c`, shared with T6 and T8.
 
 ---
 
@@ -14,8 +14,8 @@ measurement is a synthetic tensor of the right shape. Session `6c79f20d6c13`, sh
 
 **Decode runs at 0.5% of the GPU's compute — and that is near-optimal, not wasteful.**
 
-The decode MLP projection reaches 1.42 TFLOP/s against a 263.6 TFLOP/s ceiling. But the ceiling it
-is actually under is the *memory* roof, which at 1.0 FLOP/byte is `1734.8 GB/s × 1` = **1.73
+The decode MLP projection reaches 1.42 TFLOP/s against a 260.4 TFLOP/s ceiling. But the ceiling it
+is actually under is the *memory* roof, which at 1.0 FLOP/byte is `1736.7 GB/s × 1` = **1.74
 TFLOP/s**. It hits **82% of that.** The kernel is running nearly as fast as the hardware permits;
 the hardware simply does not permit much when each byte is used once.
 
@@ -25,9 +25,9 @@ That distinction — "underutilised" versus "memory-bound" — is the entire rea
 
 | | measured | A100 spec | achieved |
 |---|---|---|---|
-| memory bandwidth | **1,734.8 GB/s** | 2,039 | 85% |
-| compute (bf16) | **263.6 TFLOP/s** | 312 | 84% |
-| **ridge point** | **152.0 FLOPs/byte** | | |
+| memory bandwidth | **1,736.7 GB/s** | 2,039 | 85% |
+| compute (bf16) | **260.4 TFLOP/s** | 312 | 83% |
+| **ridge point** | **149.9 FLOPs/byte** | | |
 
 Both ceilings land within a point of 85% of the marketing figure. Quoting the spec sheet would
 have shifted every conclusion by the same 15%.
@@ -36,24 +36,24 @@ Peak is also strongly **shape**-dependent, which is why the whole sweep is repor
 
 | square GEMM | 1024 | 2048 | 4096 | 8192 | 16384 |
 |---|---|---|---|---|---|
-| TFLOP/s | 50.2 | 126.5 | 219.3 | 251.9 | **263.6** |
+| TFLOP/s | 55.8 | 125.4 | 218.3 | 242.9 | **260.4** |
 
-A 1024² matmul reaches **19%** of what a 16384² one does on identical silicon. "Peak FLOP/s"
+A 1024² matmul reaches **21%** of what a 16384² one does on identical silicon. "Peak FLOP/s"
 measured at one arbitrary size is not a hardware property.
 
 ### The two regimes
 
 | shape | AI (FLOPs/byte) | TFLOP/s | % of peak | bound by |
 |---|---|---|---|---|
-| prefill MLP up-projection | 1,219 | 231.3 | **87.8%** | compute |
-| prefill QKV projection | 956 | 159.2 | 60.4% | compute |
+| prefill MLP up-projection | 1,219 | 230.9 | **88.7%** | compute |
+| prefill QKV projection | 956 | 158.2 | 60.8% | compute |
 | decode MLP up-projection | 1.0 | 1.42 | 0.5% | memory |
-| decode QKV projection | 1.0 | 0.74 | 0.3% | memory |
+| decode QKV projection | 1.0 | 0.71 | 0.3% | memory |
 
 Same weights, same model, **three orders of magnitude apart in arithmetic intensity** and on
 opposite sides of the ridge. Prefill is a different machine from decode.
 
-**Pre-registered band:** best prefill shape ≥ 70% of measured peak → **WITHIN (87.8%)** ✓
+**Pre-registered band:** best prefill shape ≥ 70% of measured peak → **WITHIN (88.7%)** ✓
 
 ## Batching walks decode to the ridge, and then stops paying
 
@@ -61,19 +61,19 @@ opposite sides of the ridge. Prefill is a different machine from decode.
 
 | batch | AI | TFLOP/s | implied GB/s |
 |---|---|---|---|
-| 1 | 1.0 | 1.41 | 1,414 |
-| 8 | 8.0 | 11.2 | 1,408 |
-| 64 | 62.7 | 88.1 | 1,405 |
-| 128 | 122.8 | 149.1 | 1,214 |
-| 256 | 236.0 | 155.0 | 657 |
+| 1 | 1.0 | 1.44 | 1,444 |
+| 8 | 8.0 | 11.5 | 1,437 |
+| 64 | 62.7 | 87.1 | 1,390 |
+| 128 | 122.8 | 149.0 | 1,213 |
+| 256 | 236.0 | 154.4 | 654 |
 
-**Batch 1 → 128: throughput ×105. Batch 128 → 256: ×1.04.**
+**Batch 1 → 128: throughput ×103. Batch 128 → 256: ×1.04.**
 
 The `implied GB/s` column is the mechanism, and it is the most useful number here. From batch 1 to
-64 it is **pinned at ~1,410 GB/s** — the kernel is bandwidth-saturated the entire way up, and every
-doubling of batch buys a near-doubling of throughput for free, because the weights are read once
-regardless. Batch 256 is the first point whose intensity (236) exceeds the ridge (152); it has
-crossed into compute-bound territory, bandwidth utilisation collapses to 657 GB/s, and the gains
+64 it is **pinned at ~1,390–1,444 GB/s** — the kernel is bandwidth-saturated the entire way up, and
+every doubling of batch buys a near-doubling of throughput for free, because the weights are read
+once regardless. Batch 256 is the first point whose intensity (236) exceeds the ridge (150); it has
+crossed into compute-bound territory, bandwidth utilisation collapses to 654 GB/s, and the gains
 stop dead.
 
 Continuous batching is not a heuristic. It is the exploitation of a flat line on this plot, and it
@@ -81,11 +81,12 @@ runs out at a point the hardware fixes in advance.
 
 ## Inference payoff
 
-1. **Decode is memory-bound by two orders of magnitude** (AI 1.0 vs ridge 152). Buying FLOP/s to
+1. **Decode is memory-bound by two orders of magnitude** (AI 1.0 vs ridge 150). Buying FLOP/s to
    speed up decode is buying the wrong thing.
 2. **Quantisation is a bandwidth optimisation, not a compute one.** AI = `2/bytes_per_param`, so
    int8 doubles arithmetic intensity and int4 quadruples it — it moves the point rightward, which
-   is the only direction that helps.
+   is the only direction that helps. **T8 builds that kernel and measures what the move actually
+   costs**, which turns out to be more than this arithmetic suggests.
 3. **Batch until the ridge, then stop.** The ceiling is `peak_FLOPs / bandwidth` and it is knowable
    before you run anything.
 4. **Prefill and decode should be scheduled as different workloads** — one saturates compute, the
@@ -95,18 +96,18 @@ runs out at a point the hardware fixes in advance.
 
 ## What surprised me
 
-- **The QKV projection got 60.4% where the MLP got 87.8%** — same regime, same hardware, both
+- **The QKV projection got 60.8% where the MLP got 88.7%** — same regime, same hardware, both
   firmly compute-bound. The difference is shape: 3584 output columns tile onto the SMs worse than
   18944. I had assumed "compute-bound" was the end of the analysis; it is the beginning of one.
-- **The same effect appears in decode**, larger: 1,420 GB/s for the MLP projection versus 744 GB/s
+- **The same effect appears in decode**, larger: 1,419 GB/s for the MLP projection versus 712 GB/s
   for QKV. A 2× spread between two kernels in the same layer of the same model.
 - **The implied-bandwidth column was an afterthought** and turned out to be the strongest evidence
-  in the topic — a flat ~1,410 GB/s across six batch sizes says "bandwidth-saturated" far more
+  in the topic — a flat ~1,400 GB/s across six batch sizes says "bandwidth-saturated" far more
   convincingly than any single point could.
-- **Both ceilings landing within a point of 85% of spec** (85% and 84%) is a coincidence, but a
+- **Both ceilings landing within two points of 85% of spec** (85% and 83%) is a coincidence, but a
   useful one for remembering roughly what a datasheet is worth.
-- **The GEMM sweep spans 5.2×.** I expected shape sensitivity; I did not expect the small end to be
-  under a fifth of the large end.
+- **The GEMM sweep spans 4.7×.** I expected shape sensitivity; I did not expect the small end to be
+  barely a fifth of the large end.
 
 ## What is not measured
 

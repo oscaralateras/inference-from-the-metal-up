@@ -3,9 +3,9 @@
 **Question:** Can I predict an LLM's decode throughput from first principles, and account for every
 token I don't get?
 
-**Setup:** Qwen2.5-7B (7.62B params) in bfloat16 on an NVIDIA A100-SXM4-80GB, SM 1230 MHz /
-memory 1593 MHz. System under test is **vLLM**, not a bare `transformers` loop. Context 512 unless
-stated. Session `6c79f20d6c13`, shared with T7.
+**Setup:** Qwen2.5-7B (7.62B params) in bfloat16 on an NVIDIA A100-SXM4-80GB, SM 1215 MHz /
+memory 1593 MHz, torch 2.8.0+cu128, vLLM 0.11.0. System under test is **vLLM**, not a bare
+`transformers` loop. Context 512 unless stated. Session `ea734b39914c`, shared with T7 and T8.
 
 ---
 
@@ -15,22 +15,34 @@ stated. Session `6c79f20d6c13`, shared with T7.
 
 | | predicted | measured | verdict |
 |---|---|---|---|
-| decode throughput, batch 1 | 122.7 tok/s | **94.3 tok/s** | **1.30×** — WITHIN band (2.0×) ✓ |
-| unexplained residual | ≤ 25% | **22.9%** | WITHIN ✓ |
+| decode throughput, batch 1 | 122.8 tok/s | **90.5 tok/s** | **1.36×** — WITHIN band (2.0×) ✓ |
+| unexplained residual | ≤ 25% | **26.1%** | **OUTSIDE** ✗ |
 
-Both bands were committed before the run, along with the arithmetic behind them.
+Both bands were committed before the run, along with the arithmetic behind them. **One failed**, and
+is left failed rather than widened afterwards — see below.
 
-**A 7B model decodes at 94 tokens/sec, and 77% of every step is one thing: reading 14.1 GB of
+**A 7B model decodes at 90.5 tokens/sec, and 74% of every step is one thing: reading 14.1 GB of
 weights.** The KV cache is 0.2%. Activations round to zero. Everything else in the system — the
-scheduler, the attention kernel, the sampler — shares the remaining 23%.
+scheduler, the attention kernel, the sampler — shares the remaining 26%.
 
 | term | ms | share | |
 |---|---|---|---|
-| weights | 8.15 | **76.9%** | 14.14 GB read once, at the session's streaming bandwidth |
+| weights | 8.14 | **73.7%** | 14.14 GB read once, at the session's streaming bandwidth |
 | kv_cache | 0.02 | 0.2% | K and V for 512 past positions |
 | activations | 0.00 | 0.0% | norms, residual adds, MLP intermediates |
-| unexplained | 2.43 | **22.9%** | small-GEMV kernels below streaming bandwidth; attention; scheduling |
-| **measured** | **10.60** | | |
+| unexplained | 2.88 | **26.1%** | small-GEMV kernels below streaming bandwidth; attention; scheduling |
+| **measured** | **11.05** | | |
+
+### The band that failed, and why it stays failed
+
+The residual band said the model should account for at least 75% of the step. It accounts for
+73.9% — a **1.1-point miss on a threshold set by judgement**, not a structural error. The weight
+term, which carries the physics, landed at 8.14 ms against 8.15 ms measured on a different A100
+pod weeks earlier: the model is right about what dominates. What grew is the software around it,
+consistent with CUDA graphs being worth less on this stack (15–36% here, 34–46% before).
+
+Moving a band after seeing the data defeats the purpose of pre-registering it. A band that has
+never failed is not a test.
 
 The arithmetic that gets there:
 
@@ -40,14 +52,14 @@ The arithmetic that gets there:
 | FLOPs / token | 14.14 GFLOP | `2P`: one multiply, one add per weight |
 | bytes / token | 14.14 GB | `P × 2`: each weight read once |
 | arithmetic intensity | **1.0 FLOP/byte** | `2 / bytes_per_param` |
-| ridge point (measured) | 152 FLOPs/byte | decode sits **152× below it** |
+| ridge point (measured) | 150 FLOPs/byte | decode sits **150× below it** |
 
 ## Effective bandwidth is the number worth remembering
 
-**1,337 GB/s — 77% of the 1,735 GB/s a large streaming copy sustains on the same GPU in the same
+**1,283 GB/s — 74% of the 1,737 GB/s a large streaming copy sustains on the same GPU in the same
 session.**
 
-That 23% shortfall *is* the residual, and it is not waste. A decode step is not one contiguous read;
+That 26% shortfall *is* the residual, and it is not waste. A decode step is not one contiguous read;
 it is a sequence of GEMV kernels against separate weight matrices. T7 measured the same effect
 directly and independently: a large decode GEMV reaches 1,420 GB/s while a smaller one reaches only
 744 GB/s. Weighting those two kernel classes by their share of the weights a decode step reads
