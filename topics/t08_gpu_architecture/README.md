@@ -13,9 +13,12 @@ byte budget depends on the shape and not the values. Session `ea734b39914c`, sha
 
 ![the decode point moves](results/int4_roofline.png)
 
-**Storing weights in int4 cuts the bytes 3.88× and buys 1.56×. The difference is arithmetic:
-quantisation does not remove work, it trades memory traffic for compute — and on an A100 that trade
-is close to a wash.**
+**Storing weights in int4 cuts the bytes 3.88× and buys 1.56×.**
+
+Quantisation does not remove work; it trades one cost for two others. Half the shortfall is that a
+compressed weight is a *shorter read*, and a shorter read gives the memory system less time to reach
+steady state. The other half is the dequantisation arithmetic, which grows exactly as fast as the
+byte count falls. A load-only control — same shape, same bytes, no maths — separates them.
 
 | kernel | bytes / launch | ms | GB/s | % of memory roof |
 |---|---|---|---|---|
