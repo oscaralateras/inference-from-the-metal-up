@@ -139,16 +139,30 @@ comparable to the others — only its scaling is, which is why the figure below 
 
 ![Scaling of the five strategies with communication volume annotated](results/strategies_throughput.png)
 
-**Communication cost is real, and NVLink does not hide it.** DP communicates nothing and scales
-best at 3.77x of a theoretical 4x. TP moves **940 MB per step — 16x more than PP** — and gives up
-about 20% of its scaling to it. This is on the best interconnect available: NV12, roughly 600 GB/s.
-The penalty is not a rounding error even there, which is precisely why TP is confined to a node.
+**Scaling order is not communication order.** Ranked by bytes moved, the order is
+DP (0) < PP = EP (59 MB) < SP (352) < TP (940). Ranked by scaling it is
+DP > SP > EP > TP > **PP**. The strategy that communicates least among the dense three scales
+*worst*. Whatever is costing these strategies their scaling, it is not simply bandwidth.
 
-**But bandwidth is not the whole story, and this was the surprise.** PP scales *worst* (2.48x)
-despite communicating almost nothing — 59 MB against TP's 940 MB. Its loss is the **bubble**, not
-bandwidth. On NVLink, TP's 16x communication premium costs *less* than PP's structural idle time.
-Two strategies, near-identical memory profiles, opposite failure modes, and the cheaper-to-
-communicate one loses. Comparing them on a single axis is what makes that visible.
+**Where PP's loss comes from: the bubble, quantitatively.** With P = 4 stages and M = 8
+microbatches, Result B's formula caps efficiency at `M/(M+P-1)` = 8/11 = **0.727**, i.e. a ceiling
+of **2.91x** on four devices *before a single byte is sent*. PP measured **2.48x — 85% of that
+ceiling**. Its poor scaling is almost entirely structural idle time, and the closed form predicted
+it independently.
+
+**Where TP's loss does *not* come from: bandwidth.** This is the part that surprised me and the
+part I initially got wrong. TP's 940 MB payload becomes ~1.41 GB of wire traffic for a ring
+all-reduce, which at NV12's ~600 GB/s is **2.35 ms against a 52.9 ms step — about 4%**. But TP
+scales ~21% worse than DP. **Bandwidth accounts for roughly a fifth of TP's loss.** The rest is
+not volume but *frequency and shape*: 16 blocking all-reduces per step (two per layer), each a
+barrier where every rank waits for the slowest, plus each rank running a matmul 1/4 the size and
+therefore proportionally less efficient on the GPU.
+
+So the honest statement is stronger than "communication is expensive": **communication *volume*
+does not even predict communication *cost*, let alone scaling.** Two strategies moving 59 MB each
+(PP and EP) scale 2.48x and 3.15x. One moving 16x more (TP) beats both of them on one axis and
+loses on another. The PCIe comparison is the clean test of this claim — see *What is not measured
+yet*.
 
 **The memory column decides which strategies are even available.** DP and SP hold **3,729 MB per
 rank at every world size** — they replicate. TP and PP divide to 932 MB at four devices; EP to 407.
@@ -203,10 +217,12 @@ communication cost. An MLP-only study cannot measure four of the five honestly.
 
 *How you split a model decides how it fails, and the failure modes are not interchangeable.* On the
 fastest interconnect available — NV12 NVLink, ~600 GB/s — the five strategies converted 4 GPUs into
-between **3.77x and 2.48x**, and the ordering is not a communication ranking. DP moves zero bytes
-and scales best (3.77x). TP moves **16x more data than PP** (940 MB vs 59 MB per step) and still
-scales *better* than it (2.96x vs 2.48x), because PP's bubble costs more than TP's bandwidth on a
-fast link. And the strategies that scale best on throughput — DP and SP — are the two that
+between **3.77x and 2.48x**, and **the ordering is not a communication ranking**. TP moves 16x more
+data than PP (940 MB vs 59 MB per step) and still scales *better* (2.96x vs 2.48x). Neither loss is
+what it looks like: PP's is structural idle time — the bubble caps it at 2.91x before any byte
+moves, and it hit 85% of that — while TP's bandwidth accounts for only ~4% of its step time, the
+rest going to 16 synchronisation barriers per step and to each rank running a quarter-sized, less
+efficient matmul. And the strategies that scale best on throughput — DP and SP — are the two that
 **replicate the whole model** (3,729 MB/rank at every world size), so neither can serve a model
 that does not fit. Meanwhile expert parallelism loses **55% of its throughput to routing skew
 alone**, with identical hardware, FLOPs and bytes moved. There is no best strategy; there is only
@@ -230,11 +246,16 @@ which bill you can afford to pay.
 - **The 64-byte cache line has an analogue in head counts.** TP degree must divide the head count —
   a hardware-flavoured divisibility constraint sitting in the middle of what looks like a pure
   software choice.
-- **The strategy that communicates least scaled worst.** I expected the scaling order to follow the
+- **The strategy that communicates least scaled worst.** I expected scaling order to follow
   communication order. It did not: PP moves 59 MB per step and TP moves 940, yet TP scales better
-  (2.96x vs 2.48x). On NVLink, 16x the bandwidth cost is cheaper than a pipeline bubble. Had I only
-  measured bytes — as the CPU run did — I would have predicted the opposite ordering and been
-  wrong.
+  (2.96x vs 2.48x). Had I only measured bytes — as the CPU run did — I would have predicted the
+  opposite ordering and been wrong.
+- **Then I over-attributed the correction, and the arithmetic caught it.** My first reading was
+  "TP pays 20% for its bandwidth." Working it out: 940 MB becomes ~1.41 GB of ring traffic, which
+  at 600 GB/s is 2.35 ms of a 52.9 ms step — **~4%**, not 20%. Most of TP's loss is *synchronisation
+  frequency* (16 barriers per step) and *shrinking matmuls*, not bytes. Communication volume is a
+  poor proxy for communication cost, and I had to be shown that by a calculator rather than by a
+  plot.
 - **Routing skew cost more than any interconnect decision.** EP lost 55% of its throughput to an
   uneven router with identical hardware, identical FLOPs and identical bytes moved. That is a
   bigger effect than the entire spread between the four dense strategies. The most expensive thing
