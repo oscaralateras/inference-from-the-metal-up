@@ -164,8 +164,14 @@ if HAS_TRITON:
                 other=0.0,
             ).to(tl.float32)
 
-            acc += tl.sum(code_lo * x_lo[None, :], axis=1) * scale_lo
-            acc += tl.sum(code_hi * x_hi[None, :], axis=1) * scale_hi
+            # Single-stream: the two nibble halves are joined into one (rows, group, 2) tile and
+            # reduced together, rather than reduced separately and added. Same arithmetic, half as
+            # many reduction trees — a `tl.sum` over the group axis is a log2(GROUP_SIZE) shuffle
+            # cascade, and issuing two of them per iteration serialises two cascades where one
+            # would do. The scales join the same way and meet the (rows, 2) partial sums.
+            joined = tl.join(code_lo * x_lo[None, :], code_hi * x_hi[None, :])
+            partial = tl.sum(joined, axis=1)
+            acc += tl.sum(partial * tl.join(scale_lo, scale_hi), axis=1)
 
         tl.store(y_ptr + offs_n, acc, mask=mask_n)
 
