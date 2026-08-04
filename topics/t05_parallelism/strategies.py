@@ -71,8 +71,20 @@ class Result:
     comms_bytes_per_step: int
     weight_bytes_per_rank: int
     max_rel_err: float
+    tolerance: float = 1e-4
     routing: str = ""
     load_factor: float = 1.0
+
+
+# Correctness tolerance per dtype. A sharded strategy sums partial results in a different order
+# than the unsharded reference, so the reconstruction is only exact up to the dtype's precision.
+# In fp32 that is ~1e-6; in bfloat16 (8 mantissa bits, epsilon ~= 7.8e-3) it is ~1e-2. Without a
+# dtype-aware bound, a legitimate bf16 result looks identical to a genuine bug.
+TOLERANCE: dict[str, float] = {
+    "float32": 1e-4,
+    "float16": 2e-2,
+    "bfloat16": 6e-2,
+}
 
 
 def _elem_bytes(t: torch.Tensor) -> int:
@@ -345,6 +357,7 @@ def _worker(rank: int, world: int, cfg: dict, out_path: str) -> None:
             comms_bytes_per_step=comms,
             weight_bytes_per_rank=weight_bytes,
             max_rel_err=err,
+            tolerance=TOLERANCE[cfg["dtype"]],
             routing=cfg["routing"] if cfg["strategy"] == "ep" else "",
             load_factor=load_factor(assignment.cpu(), N_EXPERTS, world)
             if cfg["strategy"] == "ep"
@@ -440,6 +453,7 @@ def _main() -> None:
     print("-" * 74)
 
     rows: list[dict[str, object]] = []
+    failures = 0
     for strategy in strategies:
         for world in world_sizes:
             if strategy == "pp" and args.layers % world:
@@ -455,10 +469,12 @@ def _main() -> None:
             except Exception as exc:  # noqa: BLE001 - report and continue the sweep
                 print(f"{strategy:>9} {world:>3}   FAILED: {type(exc).__name__}: {exc}")
                 continue
+            ok = "OK" if r.max_rel_err <= r.tolerance else "FAIL"
+            failures += r.max_rel_err > r.tolerance
             print(
                 f"{r.strategy:>9} {r.world_size:>3} {r.tokens_per_s:>12,.0f} "
                 f"{r.comms_bytes_per_step / 1e6:>14.2f} {r.weight_bytes_per_rank / 1e6:>11.1f} "
-                f"{r.max_rel_err:>10.2e} {r.load_factor:>6.2f}"
+                f"{r.max_rel_err:>10.2e} {ok:>4} {r.load_factor:>6.2f}"
             )
             for metric, value in (
                 ("tokens_per_s", r.tokens_per_s),
@@ -480,6 +496,14 @@ def _main() -> None:
     from results_io import append_rows
 
     append_rows(rows)
+    tol = TOLERANCE[args.dtype]
+    if failures:
+        print(
+            f"\n{failures} point(s) exceeded the {args.dtype} tolerance of {tol:.0e} — "
+            "these are NOT precision artefacts, investigate before trusting the throughput."
+        )
+        raise SystemExit(1)
+    print(f"\nall correctness checks within the {args.dtype} tolerance of {tol:.0e}")
 
 
 if __name__ == "__main__":
