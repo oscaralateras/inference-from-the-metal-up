@@ -147,3 +147,61 @@ def test_inner_reports_per_call_time_not_total() -> None:
 def test_inner_must_be_positive() -> None:
     with pytest.raises(ValueError, match="inner >= 1"):
         time_op(lambda: None, CPU, inner=0)
+
+
+def test_append_refuses_to_mix_sessions(tmp_path: Path) -> None:
+    """A partial re-run on new hardware must not leave the old session's rows alongside it.
+
+    This is the bug T6 hit: `decomposition` is written by a separate entry point, so re-running
+    only `measure.py` on a new pod left a file describing two GPUs at once — and T8, which reads
+    T6's weight share, computed a prediction from a machine it never ran on. Nothing looked wrong.
+    """
+    csv_path = tmp_path / "perf.csv"
+    append_rows(
+        csv_path,
+        [
+            {
+                "session_id": "old",
+                "experiment": "decomposition",
+                "variant": "weights",
+                "x": 0,
+                "metric": "step_time_ms",
+                "value": 8.15,
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="Mixing sessions"):
+        append_rows(
+            csv_path,
+            [
+                {
+                    "session_id": "new",
+                    "experiment": "batching",
+                    "variant": "graphs",
+                    "x": 1,
+                    "metric": "tokens_per_sec",
+                    "value": 90.3,
+                }
+            ],
+        )
+
+
+def test_append_allows_a_second_experiment_in_the_same_session(tmp_path: Path) -> None:
+    """The legitimate case T6 depends on: several entry points, one session, one file."""
+    csv_path = tmp_path / "perf.csv"
+    for experiment in ("batching", "decomposition"):
+        append_rows(
+            csv_path,
+            [
+                {
+                    "session_id": "same",
+                    "experiment": experiment,
+                    "variant": "v",
+                    "x": 0,
+                    "metric": "step_time_ms",
+                    "value": 1.0,
+                }
+            ],
+        )
+    assert {r["experiment"] for r in read_rows(csv_path)} == {"batching", "decomposition"}

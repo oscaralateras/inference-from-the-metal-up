@@ -45,6 +45,25 @@ def append_rows(csv_path: Path, rows: list[dict[str, object]]) -> None:
         with csv_path.open() as f:
             kept = [r for r in csv.DictReader(f) if (r["experiment"], r["variant"]) not in incoming]
 
+    # A partial re-run on new hardware must not leave last session's rows sitting next to this
+    # one's. Because the replace is keyed on (experiment, variant), an experiment the new run
+    # simply did not emit survives untouched — and nothing in the file records that it came from a
+    # different machine. T6 hit exactly this: its `decomposition` rows are written by a separate
+    # entry point, so re-running only `measure.py` left a file describing two GPUs at once, and
+    # T8 read a weight share from the wrong one. The result looked entirely normal.
+    #
+    # Refused rather than warned. A warning in a long GPU log is a warning nobody reads, and the
+    # failure it precedes is silent and plausible — the worst combination this repo can produce.
+    stale = {r["session_id"] for r in kept} - {str(r["session_id"]) for r in rows}
+    if stale:
+        raise ValueError(
+            f"{csv_path.name} already holds rows from session(s) {sorted(stale)} that this run "
+            f"does not replace, and the incoming rows are from "
+            f"{sorted({str(r['session_id']) for r in rows})}. Mixing sessions in one results file "
+            "silently describes two machines at once. Re-run the topic's full sequence with "
+            "--fresh, or restore the previous session's file."
+        )
+
     with csv_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
         writer.writeheader()
