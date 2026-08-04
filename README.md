@@ -23,6 +23,7 @@ compute moves it. Batching is what escapes the wall.*
 | [T3](topics/t03_memory_hierarchy) | Memory hierarchy & the memory wall | Traversal order is worth **~20×** — and the memory-bound crossover is set by the device's **ridge point**, not by the kernel. | Decode is memory-bound *specifically on GPUs* (ridge ≈ 200 vs CPU ≈ 0.18). Batching raises arithmetic intensity; that is continuous batching's whole lever. |
 | [T4](topics/t04_concurrency) | Concurrency & synchronization | Coordination taxes, all on identical work: memory layout alone **17×**, an unsynchronised counter is **78% wrong**, a locked queue costs **456×** vs sharding. | A single-lock scheduler caps tokens/sec no matter how much GPU you attach. Real engines shard dispatch — this is why. |
 | [T5](topics/t05_parallelism) | Parallelism: five ways to split a transformer | Scaling order is **not** communication order. On 4× A100 NVLink: DP **3.77×** (0 MB/step), TP **2.96×** (940 MB), PP **2.48×** (59 MB). PP is capped by its bubble at 2.91× before a byte moves; TP's bandwidth is only ~4% of its step. Routing skew alone costs EP **55%**. | Communication *volume* doesn't predict communication *cost*, let alone scaling. And DP/SP scale best while replicating the whole model — so neither can serve one that doesn't fit. |
+| [T7](topics/t07_roofline) | Roofline model & arithmetic intensity | Decode runs at **0.5%** of an A100's compute — and that is near-optimal, not wasteful: it hits **82%** of the *memory* roof it is actually under. Batching walks it from 1 to 236 FLOPs/byte, **×105 throughput to batch 128**, then **×1.04** to 256 once it crosses the ridge at 152. | Decode is memory-bound by two orders of magnitude, so quantisation (which raises intensity) beats buying FLOP/s. Batch until the ridge; the ceiling is knowable before you run anything. |
 
 ## Roadmap
 
@@ -37,7 +38,7 @@ the rest are scoped and planned.
 | T4 | Concurrency & synchronization | Rust | ✅ shipped |
 | T5 | Parallelism: five ways to split a transformer | Python · 4× GPU | ✅ shipped |
 | T6 | Performance reasoning | Python · GPU | 🔧 built, awaiting GPU run |
-| T7 | Roofline model & arithmetic intensity | Python · GPU | 🔧 built, awaiting GPU run |
+| T7 | Roofline model & arithmetic intensity | Python · GPU | ✅ shipped |
 | T8 | GPU architecture (tiled matmul) | Triton · GPU | planned |
 | T9 | Interconnects & multi-device | Python · multi-GPU | planned |
 | T10 | OS & virtual memory | C + Python | planned |
