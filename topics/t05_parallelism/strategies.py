@@ -454,6 +454,7 @@ def _main() -> None:
 
     rows: list[dict[str, object]] = []
     failures = 0
+    errors = 0
     for strategy in strategies:
         for world in world_sizes:
             if strategy == "pp" and args.layers % world:
@@ -468,6 +469,7 @@ def _main() -> None:
                 r = run(strategy, world, cfg)
             except Exception as exc:  # noqa: BLE001 - report and continue the sweep
                 print(f"{strategy:>9} {world:>3}   FAILED: {type(exc).__name__}: {exc}")
+                errors += 1
                 continue
             ok = "OK" if r.max_rel_err <= r.tolerance else "FAIL"
             failures += r.max_rel_err > r.tolerance
@@ -497,6 +499,17 @@ def _main() -> None:
 
     append_rows(rows)
     tol = TOLERANCE[args.dtype]
+    # A crashed run must never report success. Without this, a sweep where every point raised
+    # would print "all correctness checks passed" over an empty result set.
+    if errors:
+        print(
+            f"\n{errors} configuration(s) failed to run at all — no numbers were produced "
+            "for them. Fix the failure before trusting anything in this table."
+        )
+        raise SystemExit(2)
+    if not rows:
+        print("\nno results produced — nothing was measured.")
+        raise SystemExit(2)
     if failures:
         print(
             f"\n{failures} point(s) exceeded the {args.dtype} tolerance of {tol:.0e} — "
