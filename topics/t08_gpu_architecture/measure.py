@@ -398,8 +398,11 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
         for metric, value in {
             "kernel_speedup": speedup,
             "speedup_vs_cublas": speedup_vs_cublas,
-            "kernel_speedup_min": baseline["ms"] / (fused["ms"] * fused_hi / fused["gbps"]),
-            "kernel_speedup_max": baseline["ms"] / (fused["ms"] * fused_lo / fused["gbps"]),
+            # Bounds on the *controlled* ratio, so they share a denominator with kernel_speedup.
+            # Computing them against cuBLAS while the headline used the Triton control produced a
+            # spread that did not contain its own median — visibly wrong only if you looked.
+            "kernel_speedup_min": triton_bf16["ms"] / (fused["ms"] * fused_hi / fused["gbps"]),
+            "kernel_speedup_max": triton_bf16["ms"] / (fused["ms"] * fused_lo / fused["gbps"]),
             "byte_ratio": pred.byte_ratio,
             "cosine": cosine,
             "end_to_end_speedup": end_to_end,
