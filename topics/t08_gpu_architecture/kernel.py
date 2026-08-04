@@ -30,13 +30,13 @@ parallelism is simply `N / BLOCK_N` programs, and with N in the tens of thousand
 fill every SM.
 
 **A wrong call, corrected by measurement.** The first version loaded a scale alongside every
-weight. The reasoning was that those hits are served by L1/L2 rather than HBM, so they cost
-latency and instructions but almost no *bandwidth* — and bandwidth is the budget. That is true and
-it is beside the point: a kernel this far left of the ridge has nothing to do but wait, so latency
-and instruction count are exactly what decide whether it reaches the roof. It measured 37% of the
-memory roof — comfortably overhead-bound, and therefore not measuring the thing the topic exists
-to measure. Pinning the tile to one quantisation group let the scale multiply leave the inner sum
-entirely. See the kernel docstring for the algebra.
+weight, on the reasoning that those hits are served by L1/L2 rather than HBM and so cost latency
+and instructions but almost no *bandwidth* — and bandwidth is the budget. Both halves are true and
+the conclusion does not follow: a kernel this far left of the ridge has nothing to do but wait, so
+instruction count is exactly what decides whether it reaches the roof. Held against the finished
+harness, per-element scales reach 52% of the memory roof and factored scales 80% — 1.95x against
+3.00x on the same silicon, same shapes, bit-identical output. The algebra is in the kernel
+docstring.
 """
 
 from __future__ import annotations
@@ -64,9 +64,9 @@ from topics.t08_gpu_architecture.pack import ZERO_OFFSET, PackedWeight, unpack_t
 # sum, and it was worth far more than the tuning freedom it cost.
 #
 # BLOCK_N reaches down to 8 because a load-only probe of this access pattern preferred narrow
-# blocks. It did not move the full kernel, which is itself informative: the shortfall is not in the
-# configuration. Kept anyway — autotune reports the best of what it is offered and never mentions
-# what it was not, so an artificially narrow space is a ceiling nobody can see.
+# blocks. Widening the space did not move the kernel on its own — the shortfall at the time was in
+# the measurement harness, not the configuration. Kept regardless: autotune reports the best of what
+# it is offered and never mentions what it was not, so a narrow space is a ceiling nobody can see.
 _BLOCK_N = (8, 16, 32, 64)
 _NUM_WARPS = (2, 4, 8)
 _NUM_STAGES = (2, 3, 4)
@@ -110,9 +110,9 @@ if HAS_TRITON:
 
         The first form multiplies by the scale once per *element* and must fetch that scale
         alongside every element. The second multiplies once per *row per group* and fetches one
-        scale per row per group — 128x fewer loads and one fewer multiply in the hot loop, for an
-        identical result. The first version measured 37% of the memory roof; being memory-bound is
-        the goal, and it was nowhere near it.
+        scale per row per group — 128x fewer loads and one fewer multiply in the hot loop, for a
+        bit-identical result. Measured A/B on an RTX 4090: 52% of the memory roof per-element
+        against 80% factored, 1.95x against 3.00x.
         """
         pid = tl.program_id(axis=0)
         offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
