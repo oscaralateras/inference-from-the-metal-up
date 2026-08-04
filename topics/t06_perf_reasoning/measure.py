@@ -110,6 +110,24 @@ def build_engine(model: str, dtype: str, *, cuda_graphs: bool, max_model_len: in
     )
 
 
+def _as_prompts(token_ids: list[list[int]]) -> Any:
+    """Wrap raw token ids in whatever prompt type this vLLM version accepts.
+
+    vLLM moved from a `prompt_token_ids=` keyword to a `TokensPrompt` object, and relocated that
+    class between the top-level package and `vllm.inputs`. Feeding pre-tokenised prompts matters:
+    it fixes the context length exactly, where tokenising text would leave it approximate and make
+    the context sweep meaningless.
+    """
+    try:
+        from vllm import TokensPrompt  # type: ignore[attr-defined]
+    except ImportError:
+        try:
+            from vllm.inputs import TokensPrompt  # type: ignore[no-redef]
+        except ImportError:
+            return [{"prompt_token_ids": ids} for ids in token_ids]
+    return [TokensPrompt(prompt_token_ids=ids) for ids in token_ids]
+
+
 def _generate(engine: Any, prompts: list[list[int]], max_tokens: int) -> tuple[float, list[float]]:
     """Run one batch to a fixed output length. Returns wall seconds and per-request latencies.
 
@@ -122,7 +140,7 @@ def _generate(engine: Any, prompts: list[list[int]], max_tokens: int) -> tuple[f
     params = SamplingParams(max_tokens=max_tokens, ignore_eos=True, temperature=0.0)
 
     start = time.perf_counter()
-    outputs = engine.generate(prompt_token_ids=prompts, sampling_params=params, use_tqdm=False)
+    outputs = engine.generate(_as_prompts(prompts), params, use_tqdm=False)
     elapsed = time.perf_counter() - start
 
     latencies: list[float] = []
