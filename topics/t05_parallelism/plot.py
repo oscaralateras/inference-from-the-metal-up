@@ -190,37 +190,81 @@ def plot_amdahl_t4() -> None:
 
 
 def plot_pipeline_bubble() -> None:
-    measured = _series("pipeline_bubble", "efficiency")
+    """The bubble law, with the one GPU measurement that tests it plotted on top.
+
+    Deliberately does NOT plot the CPU microbatch sweep. That sweep runs, but on a machine where
+    BLAS matmul does not parallelise across threads its efficiency numbers are depressed by the
+    hardware rather than by the bubble — plotting them would put a number on the chart that
+    measures the wrong thing. What is plotted instead is the exact prediction, plus the pipeline
+    efficiency actually measured on 4 GPUs, which is the honest test of the law.
+    """
     predicted = _series("pipeline_bubble", "predicted_efficiency")
-    if not measured:
+    if not predicted:
         return
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.4), sharey=True)
-    for ax, layout in zip(axes, ("balanced", "imbalanced"), strict=False):
-        if layout not in measured:
+    exp = _strategy_experiment()
+    pp = _series(exp, "tokens_per_s").get("pp", {}) if exp else {}
+
+    fig, ax = plt.subplots(figsize=(7.6, 4.8))
+    for layout, style in (("balanced", "-"), ("imbalanced", "--")):
+        if layout not in predicted:
             continue
-        ms = sorted(measured[layout])
-        c = COLOR[layout]
+        ms = sorted(predicted[layout])
         ax.plot(
             ms,
             [predicted[layout][m] for m in ms],
-            "-",
-            color="#666666",
-            linewidth=1.6,
-            label="predicted  M/(M+P-1)",
+            style,
+            color=COLOR[layout],
+            linewidth=2,
+            label=f"{layout} stages — predicted",
         )
+        ax.annotate(
+            f"{layout}\nceiling {predicted[layout][max(ms)]:.2f}",
+            xy=(max(ms), predicted[layout][max(ms)]),
+            xytext=(6, 0),
+            textcoords="offset points",
+            color=COLOR[layout],
+            fontsize=8.5,
+            va="center",
+        )
+
+    # The GPU test: PP ran with P=4 stages and M=8 microbatches. Its measured efficiency is
+    # speedup / stages, directly comparable to the predicted curve at M=8.
+    if pp and 1 in pp and 4 in pp:
+        m_used, stages = 8, 4
+        measured_eff = (pp[4] / pp[1]) / stages
         ax.plot(
-            ms, [measured[layout][m] for m in ms], "o-", color=c, linewidth=1.8, label="measured"
+            [m_used],
+            [measured_eff],
+            "o",
+            color="#000000",
+            markersize=9,
+            zorder=5,
+            label=f"measured on 4x A100 (M={m_used})",
         )
-        ax.set_xscale("log", base=2)
-        ax.set_xticks(ms)
-        ax.set_xticklabels([str(m) for m in ms])
-        ax.set_xlabel("microbatches in flight (M)")
-        ax.set_title(f"{layout} stages")
-        ax.legend(frameon=False, loc="lower right")
-    axes[0].set_ylabel("pipeline efficiency")
-    axes[0].set_ylim(0, 1.02)
-    fig.suptitle("The pipeline bubble: efficiency is bought with microbatches", y=1.02)
+        pred = predicted["balanced"][m_used] if m_used in predicted.get("balanced", {}) else None
+        if pred:
+            ax.annotate(
+                f"measured {measured_eff:.2f}\n= {100 * measured_eff / pred:.0f}% of the\n"
+                f"bubble ceiling ({pred:.2f})",
+                xy=(m_used, measured_eff),
+                xytext=(-14, -58),
+                textcoords="offset points",
+                fontsize=8.5,
+                ha="right",
+                arrowprops={"arrowstyle": "->", "color": "#666666", "linewidth": 1},
+            )
+
+    ms_all = sorted(predicted.get("balanced", predicted[next(iter(predicted))]))
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(ms_all)
+    ax.set_xticklabels([str(m) for m in ms_all])
+    ax.set_xlabel("microbatches in flight (M)")
+    ax.set_ylabel("pipeline efficiency")
+    ax.set_ylim(0, 1.05)
+    ax.set_xlim(0.9, max(ms_all) * 1.9)
+    ax.set_title("The pipeline bubble: efficiency is bought with microbatches, not bandwidth")
+    ax.legend(frameon=False, loc="upper left", fontsize=9)
     fig.savefig(RESULTS_DIR / "pipeline_bubble.png", bbox_inches="tight")
     plt.close(fig)
 

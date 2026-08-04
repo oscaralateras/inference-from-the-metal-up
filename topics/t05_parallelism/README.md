@@ -12,18 +12,30 @@ Qwen2.5-7B in bfloat16, via real NCCL collectives.
 
 ## Reproduce
 
+**Correctness and Experiment A — any machine, no GPU:**
+
 ```bash
-uv sync                                                            # once, from the repo root
-uv run python topics/t05_parallelism/amdahl.py                     # experiment A
-uv run python topics/t05_parallelism/pipeline.py                   # experiment B
-uv run python topics/t05_parallelism/strategies.py --backend gloo --world-sizes 1,2,4   # C
-uv run python topics/t05_parallelism/strategies.py --backend gloo --strategies ep --routing skewed
-uv run python topics/t05_parallelism/plot.py                       # figures
-uv run pytest topics/t05_parallelism                               # 46 unit tests
+uv sync                                                       # once, from the repo root
+uv run pytest topics/t05_parallelism                          # 45 unit tests
+uv run python topics/t05_parallelism/amdahl.py                # experiment A
+uv run python topics/t05_parallelism/strategies.py --backend gloo --world-sizes 1,2,4
+uv run python topics/t05_parallelism/plot.py                  # figures
+```
+
+**The canonical numbers in this note** — exactly the commands that produced them, on a 4x A100
+SXM node:
+
+```bash
+python strategies.py --backend nccl --world-sizes 1,2,4 \
+    --dtype bfloat16 --model Qwen/Qwen2.5-7B --batch 16 --seq 512 --layers 8
+python strategies.py --backend nccl --world-sizes 1,2,4 --strategies ep --routing skewed \
+    --dtype bfloat16 --model Qwen/Qwen2.5-7B --batch 16 --seq 512 --layers 8
 ```
 
 The harness is **backend-agnostic**: `--backend gloo` runs on CPU, `--backend nccl` runs the
 *identical* strategy code on GPUs. CPU is for correctness and rehearsal; GPU is for the numbers.
+Use a small model on CPU (`JackFram/llama-160m`, the default) and a 7B on GPU — a 160M model on an
+A100 measures kernel-launch overhead rather than communication.
 
 ---
 
@@ -61,7 +73,9 @@ option on one axis is often the one that cannot help you at all on another.
   true on hardware this study did not rent, which is what lets a CPU rehearsal say something
   honest about GPUs.
 - **Correctness.** Every strategy is checked against the unsharded forward every run. A fast wrong
-  answer is the easiest thing to produce here, and this check caught two real bugs (below).
+  answer is the easiest thing to produce here, and this check caught a real one (see *What
+  surprised me*): data parallelism silently splitting the sequence instead of the batch, running
+  at full speed and returning wrong output.
 - **Hardware.** **4x A100-SXM4-80GB**, NV12 NVLink between every GPU pair (12 bonded links,
   ~600 GB/s), CUDA 12.4, torch 2.8, NCCL. Development and correctness on CPU with the gloo backend
   — the strategy code is identical on both, so the CPU run is a genuine rehearsal rather than an
@@ -106,19 +120,31 @@ worse than that — adding workers made them actively slower. The estimator is d
 clamped to [0, 1], so this shows up as a negative number rather than being quietly rounded to
 "perfectly serial."
 
-### Result B — the pipeline bubble
+### Result B — the pipeline bubble, predicted and tested
 
-The prediction under test is `efficiency = M/(M+P-1)` for M microbatches over P stages, and its
-generalisation to uneven stages, `M·ΣW / (P·(ΣW + (M-1)·max W))`. Both are unit-tested against
-their closed forms.
+Pipeline parallelism's cost is not bandwidth, it is **idle time**. With P stages and M microbatches
+in flight, stage *r* cannot start microbatch 0 until stages 0..r-1 have finished it, and it runs
+dry at the end. Efficiency is capped at
 
-The bubble's consequence shows up directly in Result C: **PP scales worst of the five (2.48x)
-while communicating almost the least** (59 MB/step against TP's 940). Nothing else explains that
-gap — its idle time is structural, not bandwidth.
+    efficiency = M / (M + P - 1)
 
-*(The standalone microbatch sweep runs on CPU; its canonical numbers are the one part of this
-artefact still to be re-measured on x86 — the development Mac cannot time parallel matmuls
-honestly, see Caveats.)*
+which generalises to uneven stages as `M·ΣW / (P·(ΣW + (M-1)·max W))`. Both forms are unit-tested
+against their closed forms, including the asymptotes: a balanced pipeline approaches but never
+reaches 1.0, and an imbalanced one is capped by its slowest stage at `ΣW / (P · max W)` — 0.625 for
+a 4-stage line where one stage is twice as slow.
+
+![The bubble law with the measured 4-GPU point](results/pipeline_bubble.png)
+
+**The test.** PP in Result C ran with P = 4 stages and M = 8 microbatches, so the law predicts a
+ceiling of `8/11` = **0.727** efficiency — a maximum of 2.91x on four devices, *before a single
+byte is communicated*. PP measured **2.48x, i.e. 0.62 efficiency — 85% of that ceiling.** The
+remaining 15% is activation hand-off and stage jitter.
+
+So PP's last-place scaling is not a mystery and not a bandwidth problem: **a closed-form model
+written before the run predicts nearly all of it.** The figure plots that prediction with the
+measured point on it; the CPU microbatch sweep is deliberately *not* plotted, because on a machine
+where BLAS matmul does not parallelise across threads its efficiency numbers would measure the
+hardware rather than the bubble.
 
 ### Result C — what the five strategies actually cost
 
@@ -161,8 +187,7 @@ therefore proportionally less efficient on the GPU.
 So the honest statement is stronger than "communication is expensive": **communication *volume*
 does not even predict communication *cost*, let alone scaling.** Two strategies moving 59 MB each
 (PP and EP) scale 2.48x and 3.15x. One moving 16x more (TP) beats both of them on one axis and
-loses on another. The PCIe comparison is the clean test of this claim — see *What is not measured
-yet*.
+loses on another.
 
 **The memory column decides which strategies are even available.** DP and SP hold **3,729 MB per
 rank at every world size** — they replicate. TP and PP divide to 932 MB at four devices; EP to 407.
@@ -230,6 +255,36 @@ which bill you can afford to pay.
 
 ### Inference payoff
 
+- **The comms ratio does not explain the deployment topology — the *sync* ratio does.** The folk
+  rule is "TP inside a node on NVLink, PP across nodes on Ethernet," usually justified by TP's
+  bandwidth. That justification is weaker than it looks: TP's 940 MB/step is only ~4% of its step
+  time on NVLink. What actually binds TP to a node is that it stops **16 times per step** at a
+  blocking all-reduce, and a barrier's cost is dominated by *latency*, not bandwidth. Cross-node
+  latency is what would kill it — which is the same conclusion by a different and more accurate
+  mechanism.
+- **"It doesn't fit" and "it's too slow" are different questions with different answers.** DP and
+  SP replicate every weight (3,729 MB/rank at every world size); TP, PP and EP divide it. So the
+  two best-scaling strategies are unavailable the moment a model exceeds one device. A serving
+  deployment answers the memory question *first*, and only then optimises throughput among what
+  is left — which is why real stacks combine strategies rather than picking one.
+- **PP is a capacity tool, not a latency tool, and the bubble says why.** Efficiency is
+  `M/(M+P-1)`, so PP needs many microbatches in flight. Decode batches are small by construction
+  (T3) — the very thing that fills a pipeline is the thing decode does not have. PP buys you the
+  ability to span nodes; it does not buy you faster tokens.
+- **MoE serving is a load-balancing problem before it is a hardware problem.** Routing skew cost
+  55% of EP's throughput here — larger than the entire spread between the four dense strategies,
+  on identical hardware moving identical bytes. That is why production MoE stacks spend their
+  complexity budget on auxiliary load-balancing losses, expert capacity factors and drop policies
+  rather than on interconnect.
+- **TP degree is a deployment constraint, not a tuning knob.** It must divide the attention head
+  count and is capped by `num_key_value_heads` under GQA. You cannot decide to serve a 9-head
+  model at TP=2. This is a real limit on how a given checkpoint can be deployed, fixed at the
+  moment the architecture was chosen.
+- **Through-line.** T2: decode is a serial dependent chain. T3: so you batch, because decode is
+  bandwidth-bound. T4: coordinate the workers by sharing less. **T5: and when one device is not
+  enough, here are the five ways to cut the model — each with a different bill, and the cheapest
+  bill on one axis is often the unaffordable one on another.**
+
 ### What surprised me
 
 - **Amdahl's law cannot describe contention at all.** I expected the mutex curve to fit with a
@@ -263,18 +318,20 @@ which bill you can afford to pay.
 
 ### What is not measured yet
 
-- **NVLink vs PCIe.** Every number here is from NV12 NVLink. TP's ~20% scaling loss at 940 MB/step
-  should widen sharply on PCIe (~10x less bandwidth); PP's bubble should not move at all, since it
-  is structural rather than bandwidth-bound. Running the identical code on a PCIe node would turn
-  that prediction into a measurement — and it is the cleanest available test of whether the
-  communication story above is really about communication.
-- **Experiment B's canonical microbatch sweep**, which still needs an x86 run.
+- **A second interconnect.** Every throughput number is NV12 NVLink. The *ordering* of the
+  strategies follows from the decompositions and should hold anywhere; the *margins* are a
+  property of this fabric. Re-running the identical harness on a slower interconnect would test
+  the claim that TP's loss is mostly synchronisation rather than bandwidth — on a slower link,
+  bandwidth's share should grow while PP's bubble stays exactly where it is.
+- **Standalone microbatch sweep on parallel hardware.** The bubble is tested here at a single
+  (M=8, P=4) point on GPU. Sweeping M on a multicore x86 box would trace the whole curve rather
+  than testing one point on it.
 
 ### Caveats
 
 - **One interconnect, one GPU generation.** All throughput numbers are A100 SXM on NV12 NVLink.
   The *ordering* of the strategies is a property of the decompositions; the *margins* are a
-  property of this interconnect, and would change on PCIe or on H100/NVSwitch.
+  property of this interconnect, and would change on a slower fabric or on H100/NVSwitch.
 - **BLAS matmul does not parallelise across threads on Apple Silicon.** numpy and torch both route
   to the shared AMX co-processor: 4 threads on 4× the matmul work took 3.8× the wall time (1.06× of
   the ideal 4×). On the x86 EPYC box the same test gives 3.65×. Development happened on the Mac;
@@ -306,8 +363,8 @@ amdahl_calibration,injected_serial_0.05,4,speedup,3.22
 amdahl_calibration,injected_serial_0.05,0,recovered_p,0.919
 amdahl_t4,mutex,0,recovered_p,-7.665
 pipeline_bubble,balanced,16,efficiency,0.447
-strategies_gloo,tp,4,comms_bytes_per_step,100663296
-strategies_gloo,ep_skewed,4,load_factor,2.93
+strategies_nccl,tp,4,comms_bytes_per_step,939524096
+strategies_nccl,ep_skewed,4,load_factor,2.94
 ```
 
 - `experiment` — `amdahl_calibration`, `amdahl_t4`, `pipeline_bubble`, or `strategies_{backend}`

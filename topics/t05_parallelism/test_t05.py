@@ -295,3 +295,72 @@ def test_partial_rerun_does_not_delete_other_variants(tmp_path, monkeypatch):
     rows = results_io.read_rows("strategies_gloo")
     assert {r["variant"] for r in rows} == {"dp", "tp", "ep"}, "siblings were deleted"
     assert [r["value"] for r in rows if r["variant"] == "ep"] == ["9"], "ep was not refreshed"
+
+
+# ---- 4. the lab note must not drift from the data -------------------------------------------
+
+
+def _csv_value(rows, experiment: str, variant: str, workers: int, metric: str) -> float | None:
+    for r in rows:
+        if (
+            r["experiment"] == experiment
+            and r["variant"] == variant
+            and r["workers"] == str(workers)
+            and r["metric"] == metric
+        ):
+            return float(r["value"])
+    return None
+
+
+def test_lab_note_numbers_match_the_results_csv():
+    """Every throughput figure quoted in README.md must exist in results/parallelism.csv.
+
+    Lab notes rot. A number gets hand-edited, an experiment is re-run and the prose is not
+    updated, and the writeup quietly stops describing the data it claims to describe — which is
+    exactly what had happened to this repo's own index before T5 was written. This test parses
+    the Result C table out of the README and checks each figure against the CSV, so the note
+    cannot silently drift from the measurements.
+    """
+    import csv as _csv
+    import re
+    from pathlib import Path as _Path
+
+    here = _Path(__file__).parent
+    csv_path = here / "results" / "parallelism.csv"
+    readme = (here / "README.md").read_text()
+    if not csv_path.exists():
+        pytest.skip("results/parallelism.csv not present")
+
+    rows = list(_csv.DictReader(csv_path.open()))
+    experiment = (
+        "strategies_nccl" if any(r["experiment"] == "strategies_nccl" for r in rows) else None
+    )
+    if experiment is None:
+        pytest.skip("no GPU results committed")
+
+    # Rows look like: | **DP** data | 420,658 | 817,766 | **1,585,973** | **3.77x** | ... |
+    label_to_variant = {
+        "DP": "dp",
+        "SP": "sp",
+        "TP": "tp",
+        "PP": "pp",
+        "EP": "ep_uniform",
+    }
+    pattern = re.compile(
+        r"\|\s*\*\*(DP|SP|TP|PP|EP)\*\*[^|]*\|\s*\**([\d,]+)\**\s*\|\s*\**([\d,]+)\**\s*\|"
+        r"\s*\**([\d,]+)\**\s*\|"
+    )
+    found = pattern.findall(readme)
+    assert found, "could not locate the Result C throughput table in README.md"
+
+    checked = 0
+    for label, w1, w2, w4 in found:
+        variant = label_to_variant[label]
+        for workers, quoted in ((1, w1), (2, w2), (4, w4)):
+            actual = _csv_value(rows, experiment, variant, workers, "tokens_per_s")
+            assert actual is not None, f"{variant}@{workers} quoted in README but absent from CSV"
+            assert round(actual) == int(quoted.replace(",", "")), (
+                f"README claims {variant}@{workers} = {quoted}, CSV says {actual:,.0f}"
+            )
+            checked += 1
+    assert checked >= 15, f"expected at least 15 quoted figures to verify, checked {checked}"
