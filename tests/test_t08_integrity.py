@@ -52,6 +52,8 @@ T8_METRICS = {
     "kernel_speedup_min",
     "kernel_speedup_max",
     "speedup_vs_cublas",
+    "int8_speedup",
+    "int8_byte_ratio",
     "share_of_roof",
 }
 

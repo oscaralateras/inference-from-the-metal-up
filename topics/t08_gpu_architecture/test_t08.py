@@ -18,11 +18,17 @@ import pytest
 import torch
 
 from topics.t01_number_representation.quantise import dequantise, quantise_symmetric
-from topics.t08_gpu_architecture.kernel import HAS_TRITON, int4_gemv, int4_gemv_reference
+from topics.t08_gpu_architecture.kernel import (
+    HAS_TRITON,
+    int4_gemv,
+    int4_gemv_reference,
+    int8_gemv,
+)
 from topics.t08_gpu_architecture.pack import (
     N_BITS,
     PackedWeight,
     quantise_and_pack,
+    quantise_int8,
     unpack_to_dense,
 )
 
@@ -165,3 +171,40 @@ def test_packed_weight_is_immutable() -> None:
     with pytest.raises((AttributeError, TypeError)):
         pw.n = 1  # type: ignore[misc]
     assert isinstance(pw, PackedWeight)
+
+
+def test_int8_packing_is_offset_not_reinterpreted() -> None:
+    """int8 codes are stored +128 so the load can be unsigned; the round-trip must be exact."""
+    w = _weight()
+    pw = quantise_int8(w, group_size=64)
+    assert pw.bits == 8
+    assert pw.packed.shape == w.shape
+
+    expected, _ = quantise_symmetric(w.numpy().astype(np.float32), 8, "per_group", 64)
+    recovered = pw.packed.to(torch.int16) - 128
+    np.testing.assert_array_equal(recovered.numpy().astype(np.int8), expected)
+
+
+def test_int8_moves_about_twice_the_bytes_of_int4() -> None:
+    """The control trades byte reduction for arithmetic in a known ratio."""
+    w = _weight(k=256)
+    assert quantise_int8(w, 128).bytes_per_param == pytest.approx((8 + 16 / 128) / 8)
+    assert quantise_and_pack(w, 128).bytes_per_param == pytest.approx((4 + 16 / 128) / 8)
+
+
+@requires_cuda
+def test_int8_kernel_matches_a_dense_reference() -> None:
+    w = _weight(n=512, k=1024).cuda()
+    x = torch.randn(1024, device="cuda")
+    pw = quantise_int8(w, group_size=128)
+
+    codes = (pw.packed.to(torch.float32) - 128).to(torch.float32)
+    dense = codes * pw.scales.to(torch.float32).repeat_interleave(pw.group_size, dim=1)
+    torch.testing.assert_close(int8_gemv(pw, x), dense @ x, rtol=1e-3, atol=1e-4)
+
+
+@requires_cuda
+def test_int8_kernel_rejects_an_int4_weight() -> None:
+    pw = quantise_and_pack(_weight(n=64, k=256).cuda(), group_size=128)
+    with pytest.raises(ValueError, match="needs an 8-bit weight"):
+        int8_gemv(pw, torch.randn(256, device="cuda"))

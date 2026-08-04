@@ -35,8 +35,13 @@ from arch_common.results_io import append_rows, read_rows, scalar
 from arch_common.timing import time_op
 from topics.t01_number_representation.metrics import cosine_similarity
 from topics.t07_roofline.shapes import DEFAULT_HIDDEN, DEFAULT_INTERMEDIATE
-from topics.t08_gpu_architecture.kernel import bf16_gemv, int4_gemv
-from topics.t08_gpu_architecture.pack import DEFAULT_GROUP_SIZE, PackedWeight, quantise_and_pack
+from topics.t08_gpu_architecture.kernel import bf16_gemv, int4_gemv, int8_gemv
+from topics.t08_gpu_architecture.pack import (
+    DEFAULT_GROUP_SIZE,
+    PackedWeight,
+    quantise_and_pack,
+    quantise_int8,
+)
 
 RESULTS_DIR = Path(__file__).parent / "results"
 CSV_PATH = RESULTS_DIR / "int4.csv"
@@ -219,6 +224,21 @@ def benchmark_int4(
     return {"ms": ms, "gbps": moved / (ms * 1e-3) / 1e9, "bytes": float(moved)}
 
 
+def benchmark_int8(
+    packed: list[PackedWeight], x: torch.Tensor, device: torch.device
+) -> dict[str, float]:
+    """The int8 kernel — the arithmetic control.
+
+    Half the byte reduction of int4 and half the work per byte. If work per byte is what limits the
+    int4 kernel, this must reach a *higher* fraction of the memory roof despite moving more bytes.
+    """
+    nxt = _rotating(len(packed))
+    out = torch.empty(packed[0].n, device=x.device, dtype=torch.float32)
+    ms = time_op(lambda: int8_gemv(packed[nxt()], x, out=out), device, inner=LAUNCHES_PER_TIMING)
+    moved = packed[0].bytes_stored
+    return {"ms": ms, "gbps": moved / (ms * 1e-3) / 1e9, "bytes": float(moved)}
+
+
 def _verdict(value: float, lo: float, hi: float) -> str:
     return "WITHIN" if lo <= value <= hi else "OUTSIDE"
 
@@ -320,6 +340,7 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
         torch.randn(n, k, device=device, dtype=torch.float32) * 0.02 for _ in range(pool_size - 1)
     ]
     packed_pool = [pw] + [quantise_and_pack(w, args.group_size) for w in pool[1:]]
+    int8_pool = [quantise_int8(w, args.group_size) for w in pool]
 
     baseline, base_lo, base_hi = repeat_median(
         lambda: benchmark_baseline(pool, x, device), args.repeats
@@ -329,6 +350,9 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
     )
     fused, fused_lo, fused_hi = repeat_median(
         lambda: benchmark_int4(packed_pool, x, device), args.repeats
+    )
+    int8, int8_lo, int8_hi = repeat_median(
+        lambda: benchmark_int8(int8_pool, x, device), args.repeats
     )
 
     reference = (weight @ x).to(torch.float32)
@@ -352,6 +376,7 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
     for name, r, lo, hi in (
         ("bf16 cuBLAS", baseline, base_lo, base_hi),
         ("bf16 Triton", triton_bf16, tri_lo, tri_hi),
+        ("int8 Triton", int8, int8_lo, int8_hi),
         ("int4 Triton", fused, fused_lo, fused_hi),
     ):
         print(
@@ -364,6 +389,11 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
         f"({share_of_ratio:.0%} of the {pred.byte_ratio:.2f}x byte ratio)"
     )
     print(f"  vs cuBLAS        {speedup_vs_cublas:.2f}x  (practical, not the band)")
+    print(
+        f"  int8 control     {triton_bf16['ms'] / int8['ms']:.2f}x at "
+        f"{BASELINE_BYTES_PER_PARAM / int8_pool[0].bytes_per_param:.2f}x fewer bytes "
+        f"— half the work per byte"
+    )
     print(f"  cosine vs fp32   {cosine:.4f}")
     print(
         f"  implied decode   {end_to_end:.2f}x -> {pred.t6_tokens_per_sec * end_to_end:.1f} tok/s"
@@ -373,6 +403,7 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
     for variant, r in (
         ("bf16_cublas", baseline),
         ("bf16_triton", triton_bf16),
+        ("int8_fused", int8),
         ("int4_fused", fused),
     ):
         rows.extend(
@@ -398,6 +429,8 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
         for metric, value in {
             "kernel_speedup": speedup,
             "speedup_vs_cublas": speedup_vs_cublas,
+            "int8_speedup": triton_bf16["ms"] / int8["ms"],
+            "int8_byte_ratio": BASELINE_BYTES_PER_PARAM / int8_pool[0].bytes_per_param,
             # Bounds on the *controlled* ratio, so they share a denominator with kernel_speedup.
             # Computing them against cuBLAS while the headline used the Triton control produced a
             # spread that did not contain its own median — visibly wrong only if you looked.

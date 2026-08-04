@@ -300,6 +300,97 @@ def bf16_gemv(
     return y
 
 
+if HAS_TRITON:
+
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_N": bn}, num_warps=w, num_stages=st)
+            for bn in _BLOCK_N
+            for w in _NUM_WARPS
+            for st in _NUM_STAGES
+        ],
+        key=["n", "k"],
+    )
+    @triton.jit
+    def _int8_gemv_kernel(  # noqa: PLR0913
+        packed_ptr,
+        scales_ptr,
+        x_ptr,
+        y_ptr,
+        n,
+        k,
+        stride_pn,
+        stride_pk,
+        stride_sn,
+        stride_sg,
+        GROUP_SIZE: tl.constexpr,
+        ZERO_POINT: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """The same kernel at one weight per byte instead of two — the arithmetic control.
+
+        Structurally identical to the int4 kernel: one group-wide tile, the scale factored out of
+        the inner sum, fp32 accumulation. The only difference is that a byte is a whole code, so
+        there is no nibble to mask or shift and one multiply-accumulate per byte rather than two.
+        That halves the work per byte while only halving the byte reduction, which is exactly the
+        comparison needed to test whether work per byte is what binds.
+        """
+        pid = tl.program_id(axis=0)
+        offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < n
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        offs_in_group = tl.arange(0, GROUP_SIZE)
+
+        for k0 in range(0, k, GROUP_SIZE):
+            offs_k = k0 + offs_in_group
+            mask_k = offs_k < k
+            byte = tl.load(
+                packed_ptr + offs_n[:, None] * stride_pn + offs_k[None, :] * stride_pk,
+                mask=mask_n[:, None] & mask_k[None, :],
+                other=0,
+            )
+            code = byte.to(tl.float32) - ZERO_POINT
+            xv = tl.load(x_ptr + offs_k, mask=mask_k, other=0.0).to(tl.float32)
+            scale = tl.load(
+                scales_ptr + offs_n * stride_sn + (k0 // GROUP_SIZE) * stride_sg,
+                mask=mask_n,
+                other=0.0,
+            ).to(tl.float32)
+            acc += tl.sum(code * xv[None, :], axis=1) * scale
+
+        tl.store(y_ptr + offs_n, acc, mask=mask_n)
+
+
+def int8_gemv(pw: PackedWeight, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """`W @ x` from an int8 per-group weight — the arithmetic control for `int4_gemv`."""
+    if not HAS_TRITON:
+        raise RuntimeError("Triton is CUDA-only; see the topic README for the GPU setup")
+    if pw.bits != 8:
+        raise ValueError(f"int8_gemv needs an 8-bit weight, got {pw.bits}")
+
+    x = x.contiguous()
+    y = torch.empty(pw.n, device=x.device, dtype=torch.float32) if out is None else out
+
+    def grid(meta: dict[str, int]) -> tuple[int, ...]:
+        return (triton.cdiv(pw.n, meta["BLOCK_N"]),)
+
+    _int8_gemv_kernel[grid](
+        pw.packed,
+        pw.scales,
+        x,
+        y,
+        pw.n,
+        pw.k,
+        pw.packed.stride(0),
+        pw.packed.stride(1),
+        pw.scales.stride(0),
+        pw.scales.stride(1),
+        GROUP_SIZE=pw.group_size,
+        ZERO_POINT=128,
+    )
+    return y
+
+
 def int4_gemv_reference(pw: PackedWeight, x: torch.Tensor) -> torch.Tensor:
     """The same computation, unfused, in plain torch — the correctness oracle.
 

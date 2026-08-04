@@ -71,6 +71,7 @@ class PackedWeight:
     n: int
     k: int
     group_size: int
+    bits: int = 4
 
     @property
     def bytes_stored(self) -> int:
@@ -147,6 +148,7 @@ def quantise_and_pack(
         n=n,
         k=k,
         group_size=group_size,
+        bits=4,
     )
 
 
@@ -163,3 +165,36 @@ def unpack_to_dense(pw: PackedWeight) -> torch.Tensor:
 
     scales = pw.scales.to(torch.float32).repeat_interleave(pw.group_size, dim=1)
     return codes * scales
+
+
+def quantise_int8(weight: torch.Tensor, group_size: int = DEFAULT_GROUP_SIZE) -> PackedWeight:
+    """Quantise to int8 per-group — the same pipeline at half the codes per byte.
+
+    Exists as a *control on the arithmetic*, not as a second product. int8 halves the byte
+    reduction (1.97x against int4's 3.88x) and halves the work per byte with it: one byte carries
+    one weight instead of two, so there is no nibble to unpack and one multiply-accumulate per byte
+    rather than two. If operations per byte is what limits the int4 kernel, int8 must land closer
+    to the memory roof despite moving more bytes — which is the whole point of measuring it.
+
+    Stored offset by 128 for the same reason int4 is offset by 8: the load is unsigned and
+    subtracting a constant is cheaper than sign-extending.
+    """
+    if weight.ndim != 2:
+        raise ValueError(f"expected a 2D weight, got shape {tuple(weight.shape)}")
+    n, k = weight.shape
+    if group_size < 1 or k % group_size != 0:
+        raise ValueError(f"group_size must divide K={k}, got {group_size}")
+
+    w_np = weight.detach().to(torch.float32).cpu().numpy()
+    codes, scale_full = quantise_symmetric(w_np, 8, "per_group", group_size)
+    scales_np = scale_full.reshape(n, k // group_size, group_size)[:, :, 0]
+
+    device = weight.device
+    return PackedWeight(
+        packed=torch.from_numpy((codes.astype(np.int16) + 128).astype(np.uint8)).to(device),
+        scales=torch.from_numpy(scales_np).to(device=device, dtype=SCALE_DTYPE),
+        n=n,
+        k=k,
+        group_size=group_size,
+        bits=8,
+    )
