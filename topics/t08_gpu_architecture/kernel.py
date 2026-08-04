@@ -1,9 +1,14 @@
-# pyright: reportPossiblyUnboundVariable=false, reportIndexIssue=false
+# pyright: reportPossiblyUnboundVariable=false, reportIndexIssue=false, reportCallIssue=false
 #
 # Triton is CUDA-only and genuinely absent on the authoring Mac, so `triton`/`tl` are bound inside
 # an ImportError guard and every reference to them is unreachable without it. Pyright cannot see
 # that invariant and flags each use. Scoped to this one file rather than relaxed repo-wide; the
 # `HAS_TRITON` check in `int4_gemv` is what actually enforces it, and it raises with instructions.
+#
+# reportCallIssue is suppressed for the launch sites: `num_warps` and `num_stages` are consumed by
+# the JIT launcher rather than declared on the decorated function, so they are invisible to a type
+# checker that *can* resolve triton — which is why this only surfaced running CI on the GPU pod and
+# not on the Mac, where the import fails and the checks never get that far.
 """A fused int4-dequantise GEMV in Triton — the topic's whole intervention.
 
 T7 measured decode at 1.0 FLOPs/byte and 82% of the memory roof: near-optimal for the bytes it

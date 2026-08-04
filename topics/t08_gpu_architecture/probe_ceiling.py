@@ -1,7 +1,11 @@
-# pyright: reportPossiblyUnboundVariable=false, reportIndexIssue=false
+# pyright: reportPossiblyUnboundVariable=false, reportIndexIssue=false, reportCallIssue=false
 #
 # Same Triton import guard as kernel.py: `triton`/`tl` are bound inside a CUDA-only branch and every
 # use is unreachable without it. `main()` raises with instructions when Triton is absent.
+#
+# reportCallIssue is suppressed for the launch site: `num_warps` and `num_stages` are consumed by
+# JIT launcher rather than declared on the decorated function, so they are invisible to a type
+# checker that *can* resolve triton — which is why this only surfaced on the GPU pod, not the Mac.
 """What can this access pattern reach with no arithmetic at all?
 
 This probe exists because it is the measurement that broke a wrong debugging loop, and a claim that
