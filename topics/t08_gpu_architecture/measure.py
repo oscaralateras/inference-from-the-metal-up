@@ -54,6 +54,13 @@ BASELINE_BYTES_PER_PARAM = 2.0
 # variants — the comparison would be meaningless otherwise.
 LAUNCHES_PER_TIMING = 16
 
+# Whole-benchmark repeats. `time_op` already takes a median across its own iterations, but Triton's
+# autotuner re-searches in every fresh process and does not always land on the same config, which on
+# the development GPU produced a 3.10x-3.53x spread across otherwise identical runs. One run is
+# therefore a sample of the autotuner as much as of the kernel. Repeating in-process and reporting
+# the median with its spread is the difference between a number and a reproducible number.
+DEFAULT_REPEATS = 5
+
 # ---------------------------------------------------------------------------------------------
 # Pre-registered bands. Committed before the run; reported WITHIN/OUTSIDE either way. A miss that
 # gets explained is a better lab note than a hit that does not.
@@ -196,6 +203,20 @@ def _verdict(value: float, lo: float, hi: float) -> str:
     return "WITHIN" if lo <= value <= hi else "OUTSIDE"
 
 
+def repeat_median(
+    measure: Callable[[], dict[str, float]], repeats: int
+) -> tuple[dict[str, float], float, float]:
+    """Run a benchmark `repeats` times; return the median run plus the min and max of its speed.
+
+    The *median run* is returned whole rather than a per-metric median, so `ms`, `gbps` and `bytes`
+    stay mutually consistent — a synthetic row assembled from three different runs' medians would
+    report a GB/s that no single measurement ever produced.
+    """
+    runs = sorted((measure() for _ in range(repeats)), key=lambda r: r["ms"])
+    speeds = [r["gbps"] for r in runs]
+    return runs[len(runs) // 2], min(speeds), max(speeds)
+
+
 def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscure the order
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -207,6 +228,12 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
         "--skip-kernel",
         action="store_true",
         help="print the prediction and exit — no GPU or Triton required",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=DEFAULT_REPEATS,
+        help="whole-benchmark repeats; the median is reported with its spread",
     )
     parser.add_argument(
         "--layers",
@@ -274,8 +301,12 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
     ]
     packed_pool = [pw] + [quantise_and_pack(w, args.group_size) for w in pool[1:]]
 
-    baseline = benchmark_baseline(pool, x, device)
-    fused = benchmark_int4(packed_pool, x, device)
+    baseline, base_lo, base_hi = repeat_median(
+        lambda: benchmark_baseline(pool, x, device), args.repeats
+    )
+    fused, fused_lo, fused_hi = repeat_median(
+        lambda: benchmark_int4(packed_pool, x, device), args.repeats
+    )
 
     reference = (weight @ x).to(torch.float32)
     measured_y = int4_gemv(pw, x)
@@ -288,12 +319,16 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
     share_of_ratio = speedup / pred.byte_ratio
     end_to_end = 1.0 / (weight_share / speedup + (1.0 - weight_share))
 
-    print(f"{'kernel':<14} {'ms':>9} {'GB/s':>10} {'% of roof':>11}")
-    print("-" * 48)
-    for name, r in (("bf16 torch", baseline), ("int4 fused", fused)):
+    print(f"median of {args.repeats} runs\n")
+    print(f"{'kernel':<14} {'ms':>9} {'GB/s':>10} {'% of roof':>11} {'spread GB/s':>20}")
+    print("-" * 70)
+    for name, r, lo, hi in (
+        ("bf16 torch", baseline, base_lo, base_hi),
+        ("int4 fused", fused, fused_lo, fused_hi),
+    ):
         print(
             f"{name:<14} {r['ms']:>9.3f} {r['gbps']:>10,.1f} "
-            f"{r['gbps'] / profile.peak_bandwidth_gbps:>10.1%}"
+            f"{r['gbps'] / profile.peak_bandwidth_gbps:>10.1%} {lo:>10,.0f}-{hi:<9,.0f}"
         )
 
     print(
@@ -329,6 +364,8 @@ def main() -> None:  # noqa: PLR0915 - a linear script; splitting it would obscu
         }
         for metric, value in {
             "kernel_speedup": speedup,
+            "kernel_speedup_min": baseline["ms"] / (fused["ms"] * fused_hi / fused["gbps"]),
+            "kernel_speedup_max": baseline["ms"] / (fused["ms"] * fused_lo / fused["gbps"]),
             "byte_ratio": pred.byte_ratio,
             "cosine": cosine,
             "end_to_end_speedup": end_to_end,

@@ -49,6 +49,9 @@ T8_METRICS = {
     "cosine",
     "end_to_end_speedup",
     "predicted_end_to_end",
+    "kernel_speedup_min",
+    "kernel_speedup_max",
+    "share_of_roof",
 }
 
 
@@ -99,6 +102,26 @@ def test_t8_does_not_report_in_the_compute_domain() -> None:
     metrics = {r["metric"] for r in rows}
     assert not (metrics & {"achieved_tflops", "share_of_peak", "flops_per_byte"}), (
         "T8 emitted compute-domain metrics — it is scored in bytes against the memory roof"
+    )
+
+
+def test_the_load_only_ceiling_bounds_the_full_kernel() -> None:
+    """The full kernel cannot out-run the same access pattern with the arithmetic removed.
+
+    `probe_ceiling` measures loads only. Anything the full kernel appears to gain over that is a
+    measurement error, not a fast kernel — and it is the probe that localised T8's shortfall to the
+    harness, so it is worth keeping honest.
+    """
+    rows = _skip_unless_measured()
+    ceiling = [r for r in rows if r["experiment"] == "ceiling"]
+    if not ceiling:
+        pytest.skip("probe_ceiling has not been run in this session")
+
+    load_only = scalar(rows, "ceiling", "load_only", "gbps")
+    full = scalar(rows, "gemv", "int4_fused", "gbps")
+    assert full <= load_only * 1.05, (
+        f"full kernel {full:,.0f} GB/s exceeds the load-only ceiling {load_only:,.0f} GB/s — "
+        "removing work cannot make a kernel slower; check the timing"
     )
 
 

@@ -8,12 +8,13 @@ authors = [{ name = "Oscar Alateras" }]
 dependencies = [
     "numpy>=2.0",
     "matplotlib>=3.9",
-    # Pinned to a CUDA 12.8 build, deliberately, and not to the newest torch. `torch>=2.13` only
+    # Pinned to torch 2.8.0 on CUDA 12.8 — the exact stack T7's lab note records, so `uv sync`
+    # reproduces the committed results rather than approximating them. Newer torch only
     # ships as cu130, which requires driver >= 580 — on a CUDA 12.8 host it installs cleanly and
     # then reports `cuda.is_available() == False`, so the GPU tests *skip* and CI stays green while
     # nothing is tested. cu128 runs on driver 12.8 and on everything newer (CUDA minor-version
     # compatibility), so this is the portable pin, not the conservative one.
-    "torch==2.11.0",
+    "torch==2.8.0",
     "safetensors>=0.8.0",
     "huggingface-hub>=1.23.0",
     "transformers>=4.57.0",
@@ -21,7 +22,13 @@ dependencies = [
     # codegen and autotuner change between minors, so a floating version would make the kernel's
     # numbers irreproducible. CUDA-only, hence the marker — it is absent on the authoring Mac, and
     # `kernel.py` degrades to an import guard there.
-    "triton>=3.6,<3.7 ; sys_platform == 'linux'",
+    "triton>=3.4,<3.5 ; sys_platform == 'linux'",
+    # T6's system under test. Linux+CUDA only, so it is marked rather than left to fail on macOS,
+    # and pinned rather than installed ad-hoc on whichever pod happens to be running — which is how
+    # T6's original stack came to be unrecorded. vLLM changes decode scheduling and CUDA-graph
+    # capture between minors, both of which T6 measures directly, so an unpinned version means the
+    # error budget is not reproducible even on identical hardware.
+    "vllm>=0.11,<0.12 ; sys_platform == 'linux'",
 ]
 
 [dependency-groups]
@@ -59,7 +66,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 include = ["arch_common", "topics", "tests"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
-# vLLM is Linux+CUDA only — it is installed on the GPU pod, never on the authoring machine.
+# vLLM and Triton are Linux+CUDA only and genuinely absent on the authoring machine.
 reportMissingImports = "warning"
 venvPath = "."
 venv = ".venv"
