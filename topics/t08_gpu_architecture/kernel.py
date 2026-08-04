@@ -62,11 +62,11 @@ from topics.t08_gpu_architecture.pack import ZERO_OFFSET, PackedWeight, unpack_t
 # The reduction tile is *not* tunable: it is pinned to GROUP_SIZE so that one scale covers the whole
 # tile (see the loop body). Trading that knob away is what let the scale multiply leave the inner
 # sum, and it was worth far more than the tuning freedom it cost.
-# BLOCK_N reaches down to 8. A stripped load-only probe of this exact access pattern hit ~1,040
-# GB/s at BLOCK_N=16 and only ~830 at 128 — narrow blocks mean more programs, and more programs mean
-# more independent loads in flight for the scheduler to hide HBM latency behind. The first autotune
-# space started at 32 and never tried the config that works, which cost ~30 points of roof and was
-# invisible: autotune reports the best of what it was offered, never what it was not.
+#
+# BLOCK_N reaches down to 8 because a load-only probe of this access pattern preferred narrow
+# blocks. It did not move the full kernel, which is itself informative: the shortfall is not in the
+# configuration. Kept anyway — autotune reports the best of what it is offered and never mentions
+# what it was not, so an artificially narrow space is a ceiling nobody can see.
 _BLOCK_N = (8, 16, 32, 64)
 _NUM_WARPS = (2, 4, 8)
 _NUM_STAGES = (2, 3, 4)
