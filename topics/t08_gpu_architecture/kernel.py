@@ -140,13 +140,20 @@ if HAS_TRITON:
             # A @triton.jit function cannot close over ordinary Python globals — it compiles an AST
             # in isolation and only constexpr arguments cross that boundary. Passing it in keeps
             # `pack.ZERO_OFFSET` the single definition while satisfying the compiler.
-            code_lo = (byte & 0x0F).to(tl.float32) - ZERO_POINT
-            code_hi = (byte >> 4).to(tl.float32) - ZERO_POINT
+            # Dequantised in fp16, accumulated in fp32. The conversion and the multiply by x are
+            # the kernel's only real arithmetic, and on a GPU with little vector throughput per
+            # byte of bandwidth they are what binds: an A100 delivers ~9.6 fp32 FLOPs per byte
+            # against an RTX 4090's ~82, so the same kernel is memory-bound on one and
+            # arithmetic-bound on the other. fp16 halves that cost. The accumulator stays fp32
+            # because a 3584-term reduction in half precision would add a summation error on top
+            # of the quantisation error being measured, and confound the two.
+            code_lo = (byte & 0x0F).to(tl.float16) - ZERO_POINT
+            code_hi = (byte >> 4).to(tl.float16) - ZERO_POINT
 
             # x is tiny (K floats) and every program reads all of it, so it lands in L2 after the
             # first program touches it and costs essentially no HBM traffic.
-            x_lo = tl.load(x_ptr + offs_j, mask=mask_j, other=0.0).to(tl.float32)
-            x_hi = tl.load(x_ptr + offs_j + half, mask=mask_j, other=0.0).to(tl.float32)
+            x_lo = tl.load(x_ptr + offs_j, mask=mask_j, other=0.0).to(tl.float16)
+            x_hi = tl.load(x_ptr + offs_j + half, mask=mask_j, other=0.0).to(tl.float16)
 
             # Because the tile is one group wide, both group indices are loop-invariant *scalars*
             # rather than vectors, so each is a single load of BLOCK_N values. Column j sits in
@@ -163,8 +170,8 @@ if HAS_TRITON:
                 other=0.0,
             ).to(tl.float32)
 
-            acc += tl.sum(code_lo * x_lo[None, :], axis=1) * scale_lo
-            acc += tl.sum(code_hi * x_hi[None, :], axis=1) * scale_hi
+            acc += tl.sum((code_lo * x_lo[None, :]).to(tl.float32), axis=1) * scale_lo
+            acc += tl.sum((code_hi * x_hi[None, :]).to(tl.float32), axis=1) * scale_hi
 
         tl.store(y_ptr + offs_n, acc, mask=mask_n)
 
