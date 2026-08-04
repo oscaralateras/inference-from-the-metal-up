@@ -17,11 +17,12 @@ byte budget depends on the shape and not the values. Session `ea734b39914c`, sha
 quantisation does not remove work, it trades memory traffic for compute — and on an A100 that trade
 is close to a wash.**
 
-| kernel | ms | GB/s | % of memory roof |
-|---|---|---|---|
-| bf16, cuBLAS (`torch.matmul`) | 0.094 | 1,442 | 83.1% |
-| **bf16, Triton** (control) | 0.082 | **1,658** | **95.4%** |
-| **int4 fused, Triton** | **0.053** | 665 | 38.3% |
+| kernel | bytes / launch | ms | GB/s | % of memory roof |
+|---|---|---|---|---|
+| bf16, cuBLAS (`torch.matmul`) | 135.8 MB | 0.094 | 1,442 | 83.1% |
+| **bf16, Triton** (control) | 135.8 MB | 0.082 | **1,658** | **95.4%** |
+| load-only, same pattern, no arithmetic | 35.0 MB | 0.030 | 1,185 | 68.2% |
+| **int4 fused, Triton** | 35.0 MB | **0.053** | 665 | 38.3% |
 
 Median of 5 runs; the int4 spread is 664–666 GB/s.
 
@@ -62,10 +63,25 @@ the int4 kernel loses, it loses to its own arithmetic.
 The cuBLAS row stays because "should I ship this?" is a real question with a different answer:
 against what a decode step runs today, the int4 kernel is **1.79×**.
 
-## What surprised me: quantisation is a trade, not a saving
+## The gap has two causes, and only one of them is quantisation
 
-The int4 kernel reaches 40% of the bandwidth the *same framework* achieves on bf16. That is not a
-tuning failure — it is what the arithmetic costs, and the per-byte accounting makes it obvious:
+The int4 kernel reaches 40% of the bandwidth the same framework achieves on bf16. It is tempting to
+charge all of that to the dequantisation, and wrong. The load-only row above is the control that
+separates them: **same access pattern, same 35 MB, no arithmetic at all — and it reaches 68.2%, not
+95%.**
+
+| step | % of roof | cause |
+|---|---|---|
+| bf16 Triton, 135.8 MB/launch | 95.4% | — |
+| load-only, 35.0 MB/launch | 68.2% | **the smaller transfer**, nothing to do with quantisation |
+| int4 fused, 35.0 MB/launch | 38.3% | **the arithmetic** |
+
+Roughly half the shortfall is simply that reading a quarter as much per launch gives the memory
+system a quarter as long to reach steady state. That is a real cost of quantisation — a compressed
+weight *is* a shorter read — but it is a different mechanism from the arithmetic, and a kernel that
+merely loaded int4 bytes and threw them away would still not reach 95%.
+
+The other half is the dequantisation, and the per-byte accounting explains it:
 
 | | weights per byte loaded | work per byte |
 |---|---|---|
@@ -78,18 +94,14 @@ halves into one reduction — all measured within noise of each other.** That is
 this is a limit on arithmetic *volume* rather than on kernel structure: when four independent ways
 of rearranging the work change nothing, the work itself is the constraint.
 
-**Reading 4× fewer bytes means doing 4× more arithmetic per byte read.** Whether that trade pays
-depends entirely on how much compute a GPU has per byte of bandwidth:
+**Reading 4× fewer bytes means doing 4× more arithmetic per byte read**, and an A100 has roughly
+**9.6 fp32 vector FLOPs available per byte of bandwidth** (19.5 TFLOP/s against 2,039 GB/s). At ~8
+ops/byte the dequantisation consumes most of that budget, which is why the kernel sits where it
+does against its own load-only ceiling.
 
-| GPU | fp32 vector | bandwidth | FLOPs available per byte |
-|---|---|---|---|
-| RTX 4090 | ~82 TFLOP/s | 1,008 GB/s | **~82** |
-| A100-SXM4-80GB | ~19.5 TFLOP/s | 2,039 GB/s | **~9.6** |
-
-At ~8 ops/byte the int4 kernel uses a tenth of a 4090's budget and most of an A100's. The same
-kernel, unchanged, is memory-bound on the consumer card and arithmetic-bound on the datacentre one —
-because the datacentre card has nearly twice the bandwidth and under a quarter the fp32 vector
-throughput.
+The general form of the result: whether quantisation pays on a given GPU depends on that GPU's
+compute-per-byte, and a datacentre part optimised for tensor-core throughput can have far less
+*general-purpose vector* throughput per byte than the headline figures suggest.
 
 **This is why production int4 kernels are exotic.** Marlin, AWQ and the GPTQ kernels go to
 considerable lengths — bit-stuffing nibbles into fp16 mantissas to dodge the integer→float
@@ -142,9 +154,9 @@ throughput is **irrelevant** to decode. Its far smaller fp32 vector throughput i
   matmuls scale with sequence length rather than weights and belong to a different analysis.
   Accuracy is measured against the unquantised *synthetic* tensor, so it validates the kernel, not
   the model — T1 is where int4's accuracy on a real Qwen weight was established.
-- **The cross-GPU comparison is not like-for-like.** The 4090 figure quoted above came from an
-  earlier development session on different silicon, driver and clocks. It is used to make a
-  qualitative point about compute-per-byte, not as a paired measurement.
+- **One GPU.** The compute-per-byte argument above predicts that a card with more vector throughput
+  per byte would land closer to the byte ratio, but that is an inference from the datasheet, not a
+  measurement. Running the same commit on a second GPU would test it; this topic does not.
 
 ```bash
 uv sync
