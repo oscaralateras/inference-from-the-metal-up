@@ -126,40 +126,60 @@ def test_tied_embeddings_are_counted_once() -> None:
     assert untied.total_params - tied.total_params == tied.embedding_params
 
 
-def test_latency_summary_reports_the_tail_not_the_mean() -> None:
-    """p99 must track the worst samples. A mean would hide exactly the outliers that matter."""
-    from topics.t06_perf_reasoning.measure import summarise
-
-    # A single outlier in 100 samples must NOT move p99 — that is precisely what p99 means.
-    one_in_a_hundred = summarise([10.0] * 99 + [500.0], batch=1)
-    assert one_in_a_hundred["latency_p99_ms"] == pytest.approx(10.0)
-
-    # Five in 100 must, and the median must stay put while it happens.
-    five_in_a_hundred = summarise([10.0] * 95 + [500.0] * 5, batch=1)
-    assert five_in_a_hundred["latency_p50_ms"] == pytest.approx(10.0)
-    assert five_in_a_hundred["latency_p99_ms"] == pytest.approx(500.0)
-
-
-def test_littles_law_recovers_the_batch_size() -> None:
-    """concurrency = throughput x latency. Summarise must be self-consistent by construction."""
-    from topics.t06_perf_reasoning.measure import summarise
+def test_step_result_metrics_are_self_consistent() -> None:
+    """concurrency = throughput x latency. Little's law must fall out by construction."""
+    from topics.t06_perf_reasoning.measure import StepResult
 
     for batch in (1, 8, 32):
-        stats = summarise([4.0] * 20, batch=batch)
-        concurrency = stats["tokens_per_sec"] * stats["latency_p50_ms"] * 1e-3
-        assert concurrency == pytest.approx(float(batch))
+        step_ms = 20.0
+        result = StepResult(
+            step_ms=step_ms,
+            tokens_per_sec=batch / (step_ms * 1e-3),
+            request_p50_ms=100.0,
+            request_p99_ms=150.0,
+        )
+        assert result.as_metrics()["littles_law_concurrency"] == pytest.approx(float(batch))
+
+
+def test_step_result_reports_only_declared_metrics() -> None:
+    """Every metric T6 emits must be in the vocabulary the distinctness guard enforces."""
+    from tests.test_distinctness import T6_METRICS
+    from topics.t06_perf_reasoning.measure import StepResult
+
+    emitted = set(StepResult(1.0, 1.0, 1.0, 1.0).as_metrics())
+    assert emitted <= T6_METRICS, f"undeclared metrics: {emitted - T6_METRICS}"
+
+
+def test_differenced_step_time_cancels_prefill() -> None:
+    """The differencing identity the measurement rests on, checked on synthetic timings."""
+    from topics.t06_perf_reasoning.measure import LONG_TOKENS, SHORT_TOKENS
+
+    prefill_s, true_step_s = 0.400, 0.020
+    long_s = prefill_s + LONG_TOKENS * true_step_s
+    short_s = prefill_s + SHORT_TOKENS * true_step_s
+
+    recovered = (long_s - short_s) / (LONG_TOKENS - SHORT_TOKENS)
+    assert recovered == pytest.approx(true_step_s)
+
+    # Dividing a single call by its token count would fold prefill in and overstate the step.
+    naive = long_s / LONG_TOKENS
+    assert naive > recovered
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_analytic_params_match_the_real_loaded_model() -> None:
+def test_analytic_params_match_the_real_model_weights() -> None:
     """The strongest check available: the arithmetic against the weights themselves.
 
-    Skipped without a GPU, and run as part of the paid session — an analytic parameter count that
+    Skipped without a GPU and run as part of the paid session — an analytic parameter count that
     disagrees with the real model invalidates every number in the topic.
     """
-    from topics.t06_perf_reasoning.measure import DEFAULT_MODEL, load_model, shape_from_model
+    from transformers import AutoModelForCausalLM
 
-    model = load_model(DEFAULT_MODEL, torch.bfloat16, torch.device("cuda"))
+    from topics.t06_perf_reasoning.measure import DEFAULT_MODEL, shape_from_model
+
+    model = AutoModelForCausalLM.from_pretrained(
+        DEFAULT_MODEL, dtype=torch.bfloat16, low_cpu_mem_usage=True
+    )
     actual = sum(p.numel() for p in model.parameters())
     analytic = shape_from_model(DEFAULT_MODEL, bytes_per_param=2).total_params
     assert math.isclose(analytic, actual, rel_tol=0.005)

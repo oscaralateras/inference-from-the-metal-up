@@ -1,57 +1,92 @@
-"""Measure what a real model actually does, so the prediction has something to be wrong about.
+"""Measure a production inference stack, so the prediction has something real to be wrong about.
 
-Three experiments, all end-to-end over the whole model with a real KV cache:
+The system under test is **vLLM**, not a bare `transformers` forward loop. That choice is load
+bearing: an eager-mode loop spends a large fraction of every decode step launching hundreds of
+small kernels, so it measures Python and the CUDA driver as much as it measures the hardware.
+Predicting hardware behaviour and then measuring a framework's overhead answers a different
+question than the one this topic asks.
 
-* **decode**   - single-stream tokens/sec at a fixed context length. The headline number.
-* **batching** - tokens/sec and per-token p50/p99 across batch sizes. Little's law, and the
-                 throughput-versus-tail-latency tradeoff that decides real serving configs.
-* **context**  - tokens/sec across context lengths. The KV cache term made visible: the same
-                 model gets slower the more it has already said.
+Four experiments:
 
-Plus two calibration measurements that feed the gap decomposition: achieved per-launch overhead,
-and the number of module calls per decoded token.
+* **decode**   - single-stream tokens/sec at a fixed context. The headline number.
+* **batching** - throughput and request-latency percentiles across batch sizes. Little's law, and
+                 the throughput-versus-tail-latency tradeoff that decides real serving configs.
+* **context**  - throughput across context lengths, isolating the KV cache term.
+* **graphs**   - the same measurement with CUDA graphs on and off.
 
-    python measure.py --device cuda --model Qwen/Qwen2.5-7B
-    python measure.py --device cpu --model hf-internal-testing/tiny-random-LlamaForCausalLM
+That last one is the controlled experiment. vLLM captures CUDA graphs by default and
+`enforce_eager=True` turns them off, changing nothing else — same stack, same kernels, same
+weights. The difference between the two **is** per-launch overhead, measured rather than
+estimated.
+
+**Per-step time is measured by difference.** Generating N tokens costs `prefill + N x step`, so
+timing two output lengths and dividing the difference cancels prefill, scheduler startup and
+detokenisation exactly:
+
+    step_ms = (T_long - T_short) / (n_long - n_short)
+
+Timing one generate call and dividing by N folds prefill into the per-token number and overstates
+it, badly so at short output lengths.
+
+    python -m topics.t06_perf_reasoning.measure --model Qwen/Qwen2.5-7B
 """
 
 from __future__ import annotations
 
 import argparse
-import math
+import gc
 import statistics
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig
 
 from arch_common.gpu import load_profile
 from arch_common.results_io import append_rows
-from arch_common.timing import synchronize, time_op
 from topics.t06_perf_reasoning.model_math import ModelShape
 
 CSV_PATH = Path(__file__).parent / "results" / "perf.csv"
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-7B"
-DEFAULT_BATCHES = (1, 2, 4, 8, 16, 32)
-DEFAULT_CONTEXTS = (512, 2048, 8192)
+DEFAULT_BATCHES = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+DEFAULT_CONTEXTS = (512, 2048, 8192, 32768)
 DEFAULT_SEQ_LEN = 512
-DEFAULT_TOKENS = 128  # enough samples for p99 to mean something
-WARMUP_TOKENS = 5
+
+# The two output lengths differenced to isolate per-step decode time. SHORT must be long enough
+# for the scheduler to have reached steady state, and short enough that the difference is
+# dominated by decode rather than by noise.
+LONG_TOKENS = 128
+SHORT_TOKENS = 8
+
+# Headroom for the longest context sweep point plus the tokens generated from it.
+DEFAULT_MAX_MODEL_LEN = 40960
+GPU_MEMORY_UTILISATION = 0.90
 
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
 
-def load_model(name: str, dtype: torch.dtype, device: torch.device) -> torch.nn.Module:
-    """Load a causal LM in eval mode on `device`, with gradients globally off."""
-    model = AutoModelForCausalLM.from_pretrained(name, dtype=dtype, low_cpu_mem_usage=True)
-    module = cast(torch.nn.Module, model)
-    module.to(device)
-    module.eval()
-    module.requires_grad_(False)
-    return module
+@dataclass(frozen=True)
+class StepResult:
+    """One (batch, context) measurement, reduced to the numbers a serving decision needs."""
+
+    step_ms: float
+    tokens_per_sec: float
+    request_p50_ms: float
+    request_p99_ms: float
+
+    def as_metrics(self) -> dict[str, float]:
+        return {
+            "step_time_ms": self.step_ms,
+            "tokens_per_sec": self.tokens_per_sec,
+            "request_latency_p50_ms": self.request_p50_ms,
+            "request_latency_p99_ms": self.request_p99_ms,
+            # concurrency = throughput x latency. Recovering the batch size we set is the check
+            # that the measurement is internally consistent.
+            "littles_law_concurrency": self.tokens_per_sec * self.step_ms * 1e-3,
+        }
 
 
 def shape_from_model(name: str, bytes_per_param: int) -> ModelShape:
@@ -61,157 +96,94 @@ def shape_from_model(name: str, bytes_per_param: int) -> ModelShape:
     return ModelShape.from_config(config, bytes_per_param=bytes_per_param)
 
 
-@torch.inference_mode()
-def decode_latencies(
-    model, device: torch.device, batch: int, seq_len: int, n_tokens: int, vocab: int
-) -> list[float]:
-    """Prefill a batch, then decode `n_tokens` one at a time, returning per-token milliseconds.
+def build_engine(model: str, dtype: str, *, cuda_graphs: bool, max_model_len: int) -> Any:
+    """Start a vLLM engine. Imported lazily so the analytic tests run with no GPU present."""
+    from vllm import LLM
 
-    Timed per token rather than once around the whole loop, because the per-token *distribution*
-    is half the point — an outer timer reports a mean and hides the tail completely.
+    return LLM(
+        model=model,
+        dtype=dtype,
+        enforce_eager=not cuda_graphs,
+        max_model_len=max_model_len,
+        gpu_memory_utilization=GPU_MEMORY_UTILISATION,
+        disable_log_stats=True,
+    )
 
-    Each step is timed and its output reused. Decoding the same step twice (once to time it, once
-    to advance) would be wrong, not merely wasteful: the KV cache is mutated in place, so the
-    second call would append a duplicate entry and silently corrupt the context.
+
+def _generate(engine: Any, prompts: list[list[int]], max_tokens: int) -> tuple[float, list[float]]:
+    """Run one batch to a fixed output length. Returns wall seconds and per-request latencies.
+
+    `ignore_eos` forces every request to the full length. Without it requests finish at different
+    times, the batch shrinks as it runs, and the measurement silently becomes a mixture of batch
+    sizes rather than the one under test.
     """
-    prompt = torch.randint(0, vocab, (batch, seq_len), device=device)
-    out = model(input_ids=prompt, use_cache=True)
-    past = out.past_key_values
-    token = out.logits[:, -1:].argmax(dim=-1)
+    from vllm import SamplingParams
 
-    # Untimed steps first: the decode shapes differ from the prefill shapes, so cuBLAS has not yet
-    # autotuned for them and the first few tokens are unrepresentatively slow.
-    for _ in range(WARMUP_TOKENS):
-        out = model(input_ids=token, past_key_values=past, use_cache=True)
-        past = out.past_key_values
-        token = out.logits[:, -1:].argmax(dim=-1)
-    synchronize(device)
+    params = SamplingParams(max_tokens=max_tokens, ignore_eos=True, temperature=0.0)
+
+    start = time.perf_counter()
+    outputs = engine.generate(prompt_token_ids=prompts, sampling_params=params, use_tqdm=False)
+    elapsed = time.perf_counter() - start
 
     latencies: list[float] = []
-    for _ in range(n_tokens):
-        with _StepTimer(device) as timer:
-            out = model(input_ids=token, past_key_values=past, use_cache=True)
-        past = out.past_key_values
-        token = out.logits[:, -1:].argmax(dim=-1)
-        latencies.append(timer.elapsed_ms)
+    for output in outputs:
+        metrics = getattr(output, "metrics", None)
+        arrival = getattr(metrics, "arrival_time", None)
+        finished = getattr(metrics, "finished_time", None)
+        if arrival and finished:
+            latencies.append((finished - arrival) * 1e3)
 
-    return latencies
-
-
-class _StepTimer:
-    """Time one decode step, using CUDA events on GPU and a monotonic clock on CPU.
-
-    `time_op` cannot be used here because it discards the callable's return value, and each decode
-    step's output is needed to produce the next one.
-    """
-
-    def __init__(self, device: torch.device) -> None:
-        self.device = device
-        self.elapsed_ms = 0.0
-        self._start_event: torch.cuda.Event | None = None
-        self._end_event: torch.cuda.Event | None = None
-        self._start_ns = 0
-
-    def __enter__(self) -> _StepTimer:
-        if self.device.type == "cuda":
-            self._start_event = torch.cuda.Event(enable_timing=True)
-            self._end_event = torch.cuda.Event(enable_timing=True)
-            self._start_event.record()
-        else:
-            self._start_ns = time.perf_counter_ns()
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        if self._start_event is not None and self._end_event is not None:
-            self._end_event.record()
-            torch.cuda.synchronize(self.device)
-            self.elapsed_ms = self._start_event.elapsed_time(self._end_event)
-        else:
-            self.elapsed_ms = (time.perf_counter_ns() - self._start_ns) / 1e6
+    # Fall back to the wall time if this vLLM build does not expose per-request metrics; a batch
+    # of one is exactly the wall time anyway, and the note records which path was taken.
+    return elapsed, latencies or [elapsed * 1e3]
 
 
-def summarise(latencies: list[float], batch: int) -> dict[str, float]:
-    """Turn a per-token latency sample into the three numbers that describe a serving config."""
-    if not latencies:
-        raise ValueError("no latency samples — the decode loop produced nothing")
-    ordered = sorted(latencies)
-    # Nearest-rank percentile: the smallest sample at or above 99% of the distribution. With N
-    # samples the resolution is 1/N, so p99 is only meaningful once N is comfortably over 100 —
-    # `--tokens` defaults high enough for that and the lab note states the sample count.
-    p99_index = min(len(ordered) - 1, math.ceil(0.99 * len(ordered)) - 1)
-    median_ms = statistics.median(ordered)
-    return {
-        "tokens_per_sec": batch / (median_ms * 1e-3),
-        "latency_p50_ms": median_ms,
-        "latency_p99_ms": ordered[p99_index],
-    }
+def measure_step(engine: Any, batch: int, context: int, vocab: int) -> StepResult:
+    """Per-step decode cost at one (batch, context), by differencing two output lengths."""
+    prompts = [[(i * 7919 + j) % vocab for j in range(context)] for i in range(batch)]
+
+    long_s, long_latencies = _generate(engine, prompts, LONG_TOKENS)
+    short_s, _ = _generate(engine, prompts, SHORT_TOKENS)
+
+    step_ms = (long_s - short_s) / (LONG_TOKENS - SHORT_TOKENS) * 1e3
+    if step_ms <= 0:
+        raise ValueError(
+            f"differenced step time is non-positive ({step_ms:.3f} ms) at batch={batch} "
+            f"context={context} — the two generate calls did not separate, so this is noise "
+            "rather than signal"
+        )
+
+    ordered = sorted(long_latencies)
+    p99_index = min(len(ordered) - 1, -(-99 * len(ordered) // 100) - 1)
+    return StepResult(
+        step_ms=step_ms,
+        tokens_per_sec=batch / (step_ms * 1e-3),
+        request_p50_ms=statistics.median(ordered),
+        request_p99_ms=ordered[p99_index],
+    )
 
 
-@torch.inference_mode()
-def measure_launch_overhead(device: torch.device) -> float:
-    """Milliseconds per kernel launch, from a tensor small enough that the work is free.
-
-    A 32-element add does essentially no memory traffic and no arithmetic, so what is left is the
-    fixed cost of getting a kernel onto the GPU. Multiplied by the launches per token, this is the
-    part of decode that no amount of bandwidth would fix.
-    """
-    tiny = torch.ones(32, device=device)
-    return time_op(lambda: tiny.add_(1.0), device, iters=200)
-
-
-@torch.inference_mode()
-def count_module_calls(model, device: torch.device, vocab: int) -> int:
-    """Leaf modules invoked to decode one token — a lower bound on kernel launches.
-
-    A lower bound, not a count: elementwise ops, norms fused inside a module and anything in
-    functional form are invisible to module hooks. Stated as a floor in the lab note rather than
-    quietly presented as exact.
-    """
-    calls = 0
-
-    def bump(*_args: object) -> None:
-        nonlocal calls
-        calls += 1
-
-    leaves = [m for m in model.modules() if not list(m.children())]
-    handles = [m.register_forward_hook(bump) for m in leaves]
-    try:
-        prompt = torch.randint(0, vocab, (1, 8), device=device)
-        past = model(input_ids=prompt, use_cache=True).past_key_values
-        synchronize(device)
-        calls = 0
-        model(input_ids=prompt[:, -1:], past_key_values=past, use_cache=True)
-        synchronize(device)
-    finally:
-        for handle in handles:
-            handle.remove()
-
-    return calls
+def shutdown(engine: Any) -> None:
+    """Release the engine's GPU memory so the next configuration can allocate its own."""
+    del engine
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", default="bfloat16", choices=sorted(DTYPES))
     parser.add_argument("--seq-len", type=int, default=DEFAULT_SEQ_LEN)
-    parser.add_argument("--tokens", type=int, default=DEFAULT_TOKENS)
     parser.add_argument("--batches", type=int, nargs="+", default=list(DEFAULT_BATCHES))
     parser.add_argument("--contexts", type=int, nargs="+", default=list(DEFAULT_CONTEXTS))
+    parser.add_argument("--graph-batches", type=int, nargs="+", default=[1, 8, 32])
+    parser.add_argument("--max-model-len", type=int, default=DEFAULT_MAX_MODEL_LEN)
     args = parser.parse_args()
 
-    device = torch.device(args.device)
-    dtype = DTYPES[args.dtype]
     profile = load_profile()
-    shape = shape_from_model(args.model, torch.finfo(dtype).bits // 8)
-
-    print(f"model {args.model} on {profile.device_name} ({args.dtype})")
-    print(
-        f"analytic params {shape.total_params / 1e9:.2f}B, read per token "
-        f"{shape.params_read_per_token / 1e9:.2f}B\n"
-    )
-
-    model = load_model(args.model, dtype, device)
+    shape = shape_from_model(args.model, torch.finfo(DTYPES[args.dtype]).bits // 8)
     rows: list[dict[str, object]] = []
 
     def record(experiment: str, variant: str, x: int, metrics: dict[str, float]) -> None:
@@ -227,44 +199,64 @@ def main() -> None:
             for metric, value in metrics.items()
         )
 
-    # -- calibration ------------------------------------------------------------------------
-    overhead_ms = measure_launch_overhead(device)
-    module_calls = count_module_calls(model, device, shape.vocab_size)
-    record("calibration", "launch", 0, {"per_launch_ms": overhead_ms})
-    record("calibration", "launch", 0, {"module_calls_per_token": float(module_calls)})
+    print(f"{args.model} on {profile.device_name} ({args.dtype})")
     print(
-        f"per-launch {overhead_ms * 1e3:.1f} us x >={module_calls} module calls "
-        f"= >={overhead_ms * module_calls:.2f} ms/token of pure overhead\n"
+        f"stack: vLLM   analytic params {shape.total_params / 1e9:.2f}B, "
+        f"read per token {shape.params_read_per_token / 1e9:.2f}B\n"
     )
 
-    # -- batching sweep (also supplies the headline single-stream number at batch 1) ----------
-    print(f"{'batch':>6} {'tok/s':>12} {'p50 ms':>9} {'p99 ms':>9} {'concurrency':>12}")
-    print("-" * 54)
+    engine = build_engine(
+        args.model, args.dtype, cuda_graphs=True, max_model_len=args.max_model_len
+    )
+
+    print(f"{'batch':>6} {'tok/s':>12} {'step ms':>9} {'req p50':>10} {'req p99':>10} {'conc':>8}")
+    print("-" * 62)
     for batch in args.batches:
-        latencies = decode_latencies(
-            model, device, batch, args.seq_len, args.tokens, shape.vocab_size
-        )
-        stats = summarise(latencies, batch)
-        # Little's law: concurrency = throughput x latency. Recovering the batch size we set is
-        # the check that the law holds and that the measurement is self-consistent.
-        stats["littles_law_concurrency"] = stats["tokens_per_sec"] * stats["latency_p50_ms"] * 1e-3
-        record("batching", "measured", batch, stats)
+        result = measure_step(engine, batch, args.seq_len, shape.vocab_size)
+        record("batching", "cuda_graphs", batch, result.as_metrics())
         if batch == 1:
-            record("decode", "measured", args.seq_len, stats)
+            record("decode", "measured", args.seq_len, result.as_metrics())
         print(
-            f"{batch:>6} {stats['tokens_per_sec']:>12,.1f} {stats['latency_p50_ms']:>9.2f} "
-            f"{stats['latency_p99_ms']:>9.2f} {stats['littles_law_concurrency']:>12.2f}"
+            f"{batch:>6} {result.tokens_per_sec:>12,.1f} {result.step_ms:>9.2f} "
+            f"{result.request_p50_ms:>10,.0f} {result.request_p99_ms:>10,.0f} "
+            f"{result.tokens_per_sec * result.step_ms * 1e-3:>8.2f}"
         )
 
-    # -- context sweep: the KV cache term, made visible ---------------------------------------
-    print(f"\n{'context':>8} {'tok/s':>12} {'kv MB/token':>13}")
-    print("-" * 36)
+    print(f"\n{'context':>8} {'tok/s':>12} {'step ms':>9} {'kv MB/token':>13}")
+    print("-" * 46)
     for context in args.contexts:
-        latencies = decode_latencies(model, device, 1, context, args.tokens, shape.vocab_size)
-        stats = summarise(latencies, 1)
-        record("context", "measured", context, stats)
-        kv_mb = shape.kv_cache_bytes(context) / 1e6
-        print(f"{context:>8} {stats['tokens_per_sec']:>12,.1f} {kv_mb:>13,.1f}")
+        if context + LONG_TOKENS > args.max_model_len:
+            print(f"{context:>8}  skipped — exceeds max_model_len {args.max_model_len:,}")
+            continue
+        result = measure_step(engine, 1, context, shape.vocab_size)
+        record("context", "cuda_graphs", context, result.as_metrics())
+        print(
+            f"{context:>8} {result.tokens_per_sec:>12,.1f} {result.step_ms:>9.2f} "
+            f"{shape.kv_cache_bytes(context) / 1e6:>13,.1f}"
+        )
+
+    graphs_on = {
+        batch: measure_step(engine, batch, args.seq_len, shape.vocab_size)
+        for batch in args.graph_batches
+    }
+    shutdown(engine)
+
+    # Same stack, same kernels, same weights — graphs off. The only variable is launch overhead.
+    engine = build_engine(
+        args.model, args.dtype, cuda_graphs=False, max_model_len=args.max_model_len
+    )
+    print(f"\n{'batch':>6} {'graphs ms':>10} {'eager ms':>10} {'overhead ms':>12} {'share':>8}")
+    print("-" * 52)
+    for batch in args.graph_batches:
+        eager = measure_step(engine, batch, args.seq_len, shape.vocab_size)
+        record("graphs", "eager", batch, eager.as_metrics())
+        record("graphs", "cuda_graphs", batch, graphs_on[batch].as_metrics())
+        overhead = eager.step_ms - graphs_on[batch].step_ms
+        print(
+            f"{batch:>6} {graphs_on[batch].step_ms:>10.2f} {eager.step_ms:>10.2f} "
+            f"{overhead:>12.2f} {overhead / eager.step_ms:>7.1%}"
+        )
+    shutdown(engine)
 
     append_rows(CSV_PATH, rows)
 

@@ -37,6 +37,8 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 include = ["arch_common", "topics", "tests"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
+# vLLM is Linux+CUDA only — it is installed on the GPU pod, never on the authoring machine.
+reportMissingImports = "warning"
 venvPath = "."
 venv = ".venv"
 

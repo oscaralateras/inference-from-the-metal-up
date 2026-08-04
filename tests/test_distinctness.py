@@ -26,12 +26,11 @@ from topics.t07_roofline.measure import CSV_PATH as T7_CSV
 # Metric vocabularies. Disjoint by construction — each topic reports in its own domain's units.
 T6_METRICS = {
     "tokens_per_sec",
-    "latency_p50_ms",
-    "latency_p99_ms",
-    "littles_law_concurrency",
-    "per_launch_ms",
-    "module_calls_per_token",
     "step_time_ms",
+    "request_latency_p50_ms",
+    "request_latency_p99_ms",
+    "littles_law_concurrency",
+    "effective_bandwidth_gbps",
 }
 T7_METRICS = {
     "flops_per_byte",

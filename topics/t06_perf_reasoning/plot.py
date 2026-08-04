@@ -17,12 +17,11 @@ from arch_common.results_io import read_rows, select  # noqa: E402
 from topics.t06_perf_reasoning.measure import CSV_PATH  # noqa: E402
 
 RESULTS_DIR = Path(__file__).parent / "results"
-TERM_ORDER = ("weights", "kv_cache", "activations", "launch_overhead", "unexplained")
+TERM_ORDER = ("weights", "kv_cache", "activations", "unexplained")
 TERM_COLOURS = {
     "weights": "#1f77b4",
     "kv_cache": "#ff7f0e",
     "activations": "#2ca02c",
-    "launch_overhead": "#9467bd",
     "unexplained": "#7f7f7f",
 }
 
@@ -39,6 +38,7 @@ def plot_error_budget(rows: list[dict[str, str]], device_name: str) -> Path:
         if r["experiment"] == "decomposition" and r["metric"] == "step_time_ms"
     }
     measured = terms.pop("measured")
+    terms.pop("effective_bandwidth", None)
 
     fig, ax = plt.subplots(figsize=(7, 5.5))
     bottom = 0.0
@@ -75,8 +75,8 @@ def plot_serving_tradeoff(rows: list[dict[str, str]], device_name: str) -> Path:
     Batching buys throughput and charges for it in p99. Plotting the two against each other shows
     the knee directly, which a pair of separate curves against batch size does not.
     """
-    throughput = dict(select(rows, "batching", "measured", "tokens_per_sec"))
-    p99 = dict(select(rows, "batching", "measured", "latency_p99_ms"))
+    throughput = dict(select(rows, "batching", "cuda_graphs", "tokens_per_sec"))
+    p99 = dict(select(rows, "batching", "cuda_graphs", "request_latency_p99_ms"))
     batches = sorted(throughput)
 
     fig, ax = plt.subplots(figsize=(7.5, 5.5))
@@ -90,7 +90,7 @@ def plot_serving_tradeoff(rows: list[dict[str, str]], device_name: str) -> Path:
             fontsize=8,
         )
 
-    ax.set_xlabel("per-token p99 latency (ms)")
+    ax.set_xlabel("request p99 latency (ms)")
     ax.set_ylabel("throughput (tokens / sec)")
     ax.set_title(f"Batching buys throughput with tail latency — {device_name}")
     ax.grid(True, alpha=0.25)
@@ -108,7 +108,7 @@ def plot_context_decay(rows: list[dict[str, str]], device_name: str) -> Path:
     Most people's mental model has decode speed as a constant. It is not: the KV cache grows with
     every token generated, so the same model measurably slows down the more it has already said.
     """
-    points = select(rows, "context", "measured", "tokens_per_sec")
+    points = select(rows, "context", "cuda_graphs", "tokens_per_sec")
 
     fig, ax = plt.subplots(figsize=(7.5, 5))
     ax.plot([p[0] for p in points], [p[1] for p in points], "-o", color="#ff7f0e")
