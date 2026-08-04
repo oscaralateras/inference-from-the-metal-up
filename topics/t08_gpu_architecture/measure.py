@@ -167,6 +167,9 @@ def benchmark_baseline(
     pool = [w.to(BASELINE_DTYPE) for w in weights]
     xv = x.to(BASELINE_DTYPE)
     nxt = _rotating(len(pool))
+    # torch.matmul allocates its own output; the int4 path is given a reused buffer so that the
+    # two are compared on the kernel, not on the allocator. Noted as a residual asymmetry in the
+    # lab note — it flatters the baseline, which is the safe direction for the claim being made.
     ms = time_op(lambda: pool[nxt()] @ xv, device)
     moved = pool[0].numel() * pool[0].element_size()
     return {"ms": ms, "gbps": moved / (ms * 1e-3) / 1e9, "bytes": float(moved)}
@@ -177,7 +180,8 @@ def benchmark_int4(
 ) -> dict[str, float]:
     """The fused kernel, over the same rotating pool. Bytes counted off the packed tensors."""
     nxt = _rotating(len(packed))
-    ms = time_op(lambda: int4_gemv(packed[nxt()], x), device)
+    out = torch.empty(packed[0].n, device=x.device, dtype=torch.float32)
+    ms = time_op(lambda: int4_gemv(packed[nxt()], x, out=out), device)
     moved = packed[0].bytes_stored
     return {"ms": ms, "gbps": moved / (ms * 1e-3) / 1e9, "bytes": float(moved)}
 

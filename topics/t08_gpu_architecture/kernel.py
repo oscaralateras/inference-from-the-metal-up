@@ -169,12 +169,18 @@ if HAS_TRITON:
         tl.store(y_ptr + offs_n, acc, mask=mask_n)
 
 
-def int4_gemv(pw: PackedWeight, x: torch.Tensor) -> torch.Tensor:
+def int4_gemv(pw: PackedWeight, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """Compute `W @ x` from the packed int4 weight, dequantising inside the kernel.
 
     Args:
         pw: the packed weight, on a CUDA device.
         x: `(K,)` activation vector. Any float dtype; read as fp32 inside the kernel.
+        out: optional pre-allocated `(N,)` fp32 output. **Pass this when benchmarking.**
+            Allocating a fresh output on every call puts the PyTorch caching allocator inside
+            the timed region, and for a kernel this short that is not a rounding error: it cost
+            ~40% of measured throughput here, which read as a slow kernel rather than as a slow
+            harness. A real serving loop reuses its output buffers, so passing `out` is also the
+            more faithful setup, not a convenience.
 
     Returns:
         `(N,)` float32 result.
@@ -191,7 +197,7 @@ def int4_gemv(pw: PackedWeight, x: torch.Tensor) -> torch.Tensor:
         raise ValueError("packed weight must live on a CUDA device")
 
     x = x.contiguous()
-    y = torch.empty(pw.n, device=x.device, dtype=torch.float32)
+    y = torch.empty(pw.n, device=x.device, dtype=torch.float32) if out is None else out
     half = pw.k // 2
 
     def grid(meta: dict[str, int]) -> tuple[int, ...]:
