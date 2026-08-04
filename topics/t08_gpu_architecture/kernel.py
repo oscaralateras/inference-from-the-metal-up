@@ -84,6 +84,7 @@ if HAS_TRITON:
         stride_sn,
         stride_sg,
         GROUP_SIZE: tl.constexpr,
+        ZERO_POINT: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_J: tl.constexpr,
     ):
@@ -109,8 +110,12 @@ if HAS_TRITON:
                 mask=tile_mask,
                 other=0,
             )
-            code_lo = (byte & 0x0F).to(tl.float32) - ZERO_OFFSET
-            code_hi = (byte >> 4).to(tl.float32) - ZERO_OFFSET
+            # `ZERO_POINT` arrives as a constexpr parameter rather than being read from the module.
+            # A @triton.jit function cannot close over ordinary Python globals — it compiles an AST
+            # in isolation and only constexpr arguments cross that boundary. Passing it in keeps
+            # `pack.ZERO_OFFSET` the single definition while satisfying the compiler.
+            code_lo = (byte & 0x0F).to(tl.float32) - ZERO_POINT
+            code_hi = (byte >> 4).to(tl.float32) - ZERO_POINT
 
             # Column j sits in group j // G; its partner column j + half sits G-groups further on.
             # `half` is required to be a multiple of GROUP_SIZE (enforced at pack time), so no
@@ -180,6 +185,7 @@ def int4_gemv(pw: PackedWeight, x: torch.Tensor) -> torch.Tensor:
         pw.scales.stride(0),
         pw.scales.stride(1),
         GROUP_SIZE=pw.group_size,
+        ZERO_POINT=ZERO_OFFSET,
     )
     return y
 

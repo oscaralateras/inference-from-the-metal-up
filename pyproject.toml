@@ -8,7 +8,12 @@ authors = [{ name = "Oscar Alateras" }]
 dependencies = [
     "numpy>=2.0",
     "matplotlib>=3.9",
-    "torch>=2.13.0",
+    # Pinned to a CUDA 12.8 build, deliberately, and not to the newest torch. `torch>=2.13` only
+    # ships as cu130, which requires driver >= 580 — on a CUDA 12.8 host it installs cleanly and
+    # then reports `cuda.is_available() == False`, so the GPU tests *skip* and CI stays green while
+    # nothing is tested. cu128 runs on driver 12.8 and on everything newer (CUDA minor-version
+    # compatibility), so this is the portable pin, not the conservative one.
+    "torch==2.11.0",
     "safetensors>=0.8.0",
     "huggingface-hub>=1.23.0",
     "transformers>=4.57.0",
@@ -16,7 +21,7 @@ dependencies = [
     # codegen and autotuner change between minors, so a floating version would make the kernel's
     # numbers irreproducible. CUDA-only, hence the marker — it is absent on the authoring Mac, and
     # `kernel.py` degrades to an import guard there.
-    "triton>=3.7,<3.8 ; sys_platform == 'linux'",
+    "triton>=3.6,<3.7 ; sys_platform == 'linux'",
 ]
 
 [dependency-groups]
@@ -30,6 +35,18 @@ dev = [
 [tool.uv]
 # Not a distributable package — a repo of topic artefacts. uv just manages the venv + deps.
 package = false
+
+# PyPI serves whichever CUDA build torch has decided is current, which is how this repo ended up
+# with a cu130 wheel that could not see the GPU. Resolve torch from the cu128 index explicitly, on
+# Linux only — the index carries no macOS wheels, so the authoring machine falls back to PyPI and
+# gets the CPU build it wants.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 
 [tool.ruff]
 line-length = 100
