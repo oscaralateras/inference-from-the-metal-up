@@ -22,3 +22,6 @@ target/
 *.bin
 *.pt
 *.gguf
+
+# Session-local hardware profile — regenerated per run, describes one machine at one moment
+results/hardware.json

@@ -11,6 +11,7 @@ dependencies = [
     "torch>=2.13.0",
     "safetensors>=0.8.0",
     "huggingface-hub>=1.23.0",
+    "transformers>=4.57.0",
 ]
 
 [dependency-groups]
@@ -33,7 +34,7 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pyright]
-include = ["topics", "tests"]
+include = ["arch_common", "topics", "tests"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 venvPath = "."
@@ -41,4 +42,5 @@ venv = ".venv"
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "topics"]
+pythonpath = ["."]
 addopts = "-q"
