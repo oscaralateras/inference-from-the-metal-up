@@ -72,6 +72,12 @@ tuning failure — it is what the arithmetic costs, and the per-byte accounting 
 | bf16 | 0.5 | one multiply-accumulate per 2 bytes → **~2 ops/byte** |
 | int4 g128 | 2 | unpack two nibbles, two multiply-accumulates → **~8 ops/byte** |
 
+**Four structural variants of the kernel — a wider reduction tile, fp16 instead of fp32 arithmetic,
+the zero-point folded out of the inner loop, and single-stream accumulation joining the two nibble
+halves into one reduction — all measured within noise of each other.** That is the evidence that
+this is a limit on arithmetic *volume* rather than on kernel structure: when four independent ways
+of rearranging the work change nothing, the work itself is the constraint.
+
 **Reading 4× fewer bytes means doing 4× more arithmetic per byte read.** Whether that trade pays
 depends entirely on how much compute a GPU has per byte of bandwidth:
 
