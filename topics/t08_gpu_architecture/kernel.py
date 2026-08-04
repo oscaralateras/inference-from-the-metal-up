@@ -69,6 +69,11 @@ from topics.t08_gpu_architecture.pack import ZERO_OFFSET, PackedWeight, unpack_t
 # more programs mean more independent loads in flight for the scheduler to hide HBM latency behind.
 # Kept wide because autotune reports the best of what it is offered and never mentions what it was
 # not, so an artificially narrow space is a ceiling nobody can see.
+# fp16 bit pattern for 1024.0: exponent field 0x64, mantissa zero. OR-ing a 4-bit code into the
+# mantissa yields exactly 1024 + code, so the bias to subtract is 1024 + the zero point.
+MAGIC_FP16 = 0x6400
+MAGIC_BIAS = 1024.0 + ZERO_OFFSET
+
 _BLOCK_N = (8, 16, 32, 64)
 _NUM_WARPS = (2, 4, 8)
 _NUM_STAGES = (2, 3, 4)
@@ -99,7 +104,8 @@ if HAS_TRITON:
         stride_sn,
         stride_sg,
         GROUP_SIZE: tl.constexpr,
-        ZERO_POINT: tl.constexpr,
+        MAGIC_FP16: tl.constexpr,
+        MAGIC_BIAS: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
         """y[n] = sum_k dequant(packed[n, k]) * x[k], for a block of BLOCK_N rows.
@@ -141,13 +147,25 @@ if HAS_TRITON:
             # A @triton.jit function cannot close over ordinary Python globals — it compiles an AST
             # in isolation and only constexpr arguments cross that boundary. Passing it in keeps
             # `pack.ZERO_OFFSET` the single definition while satisfying the compiler.
-            code_lo = (byte & 0x0F).to(tl.float32) - ZERO_POINT
-            code_hi = (byte >> 4).to(tl.float32) - ZERO_POINT
+            # Unpack without an integer->float conversion, the trick production int4 kernels use.
+            # An fp16 with exponent field 0x64 and mantissa m has the exact value 1024 + m, because
+            # 2^10 * (1 + m/2^10) = 1024 + m. So OR-ing a 4-bit code into the low mantissa bits of
+            # the constant 0x6400 and reinterpreting the bits gives 1024 + code for free — the
+            # bitcast emits no instruction. Subtracting 1024 + ZERO_POINT then yields the signed
+            # code directly, replacing a convert with an OR.
+            #
+            # Arithmetic stays in fp16 through the multiply so the codes never need converting back;
+            # the accumulator is still fp32, because a 3584-term reduction in half precision would
+            # add a summation error on top of the quantisation error being measured.
+            lo_bits = (byte & 0x0F).to(tl.uint16) | MAGIC_FP16
+            hi_bits = (byte >> 4).to(tl.uint16) | MAGIC_FP16
+            code_lo = lo_bits.to(tl.float16, bitcast=True) - MAGIC_BIAS
+            code_hi = hi_bits.to(tl.float16, bitcast=True) - MAGIC_BIAS
 
             # x is tiny (K floats) and every program reads all of it, so it lands in L2 after the
             # first program touches it and costs essentially no HBM traffic.
-            x_lo = tl.load(x_ptr + offs_j, mask=mask_j, other=0.0).to(tl.float32)
-            x_hi = tl.load(x_ptr + offs_j + half, mask=mask_j, other=0.0).to(tl.float32)
+            x_lo = tl.load(x_ptr + offs_j, mask=mask_j, other=0.0).to(tl.float16)
+            x_hi = tl.load(x_ptr + offs_j + half, mask=mask_j, other=0.0).to(tl.float16)
 
             # Because the tile is one group wide, both group indices are loop-invariant *scalars*
             # rather than vectors, so each is a single load of BLOCK_N values. Column j sits in
@@ -164,8 +182,8 @@ if HAS_TRITON:
                 other=0.0,
             ).to(tl.float32)
 
-            acc += tl.sum(code_lo * x_lo[None, :], axis=1) * scale_lo
-            acc += tl.sum(code_hi * x_hi[None, :], axis=1) * scale_hi
+            acc += tl.sum((code_lo * x_lo[None, :]).to(tl.float32), axis=1) * scale_lo
+            acc += tl.sum((code_hi * x_hi[None, :]).to(tl.float32), axis=1) * scale_hi
 
         tl.store(y_ptr + offs_n, acc, mask=mask_n)
 
@@ -217,7 +235,8 @@ def int4_gemv(pw: PackedWeight, x: torch.Tensor, out: torch.Tensor | None = None
         pw.scales.stride(0),
         pw.scales.stride(1),
         GROUP_SIZE=pw.group_size,
-        ZERO_POINT=ZERO_OFFSET,
+        MAGIC_FP16=MAGIC_FP16,
+        MAGIC_BIAS=MAGIC_BIAS,
     )
     return y
 
