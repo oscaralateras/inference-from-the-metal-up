@@ -130,3 +130,20 @@ def test_scalar_refuses_an_ambiguous_lookup(tmp_path: Path) -> None:
     append_rows(csv_path, [_row("e", "a", 1, "m", 1.0), _row("e", "a", 2, "m", 2.0)])
     with pytest.raises(KeyError, match="exactly one"):
         scalar(read_rows(csv_path), "e", "a", "m")
+
+
+def test_inner_reports_per_call_time_not_total() -> None:
+    """`inner` amortises launch cost across N calls and must divide, not accumulate.
+
+    A missing division here would silently multiply every T8 timing by 16 and report a kernel
+    sixteen times slower than it is — the kind of arithmetic slip that produces a confident,
+    catastrophically wrong number rather than an error.
+    """
+    single = time_op(lambda: time.sleep(0.01), CPU, warmup=0, iters=3)
+    batched = time_op(lambda: time.sleep(0.01), CPU, warmup=0, iters=3, inner=4)
+    assert batched == pytest.approx(single, rel=0.5)
+
+
+def test_inner_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="inner >= 1"):
+        time_op(lambda: None, CPU, inner=0)

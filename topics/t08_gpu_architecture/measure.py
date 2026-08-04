@@ -48,6 +48,12 @@ T6_CSV = Path(__file__).resolve().parent.parent / "t06_perf_reasoning" / "result
 BASELINE_DTYPE = torch.bfloat16
 BASELINE_BYTES_PER_PARAM = 2.0
 
+# Back-to-back launches inside one timing window. A decode step launches hundreds of these GEMVs in
+# sequence and never pays for one in isolation, so steady-state is both the faithful measurement and
+# the one that does not report the dispatch path instead of the kernel. Applied identically to both
+# variants — the comparison would be meaningless otherwise.
+LAUNCHES_PER_TIMING = 16
+
 # ---------------------------------------------------------------------------------------------
 # Pre-registered bands. Committed before the run; reported WITHIN/OUTSIDE either way. A miss that
 # gets explained is a better lab note than a hit that does not.
@@ -170,7 +176,7 @@ def benchmark_baseline(
     # torch.matmul allocates its own output; the int4 path is given a reused buffer so that the
     # two are compared on the kernel, not on the allocator. Noted as a residual asymmetry in the
     # lab note — it flatters the baseline, which is the safe direction for the claim being made.
-    ms = time_op(lambda: pool[nxt()] @ xv, device)
+    ms = time_op(lambda: pool[nxt()] @ xv, device, inner=LAUNCHES_PER_TIMING)
     moved = pool[0].numel() * pool[0].element_size()
     return {"ms": ms, "gbps": moved / (ms * 1e-3) / 1e9, "bytes": float(moved)}
 
@@ -181,7 +187,7 @@ def benchmark_int4(
     """The fused kernel, over the same rotating pool. Bytes counted off the packed tensors."""
     nxt = _rotating(len(packed))
     out = torch.empty(packed[0].n, device=x.device, dtype=torch.float32)
-    ms = time_op(lambda: int4_gemv(packed[nxt()], x, out=out), device)
+    ms = time_op(lambda: int4_gemv(packed[nxt()], x, out=out), device, inner=LAUNCHES_PER_TIMING)
     moved = packed[0].bytes_stored
     return {"ms": ms, "gbps": moved / (ms * 1e-3) / 1e9, "bytes": float(moved)}
 
