@@ -44,6 +44,27 @@ GPU0\t X \tSYS\t0-31\t0
 GPU1\tSYS\t X \t32-63\t1
 """
 
+# Captured verbatim from the RunPod 4x A100 SXM node this topic ran on, ANSI escape and all.
+# nvidia-smi underlines the header row even when its output is piped, and with that escape left in
+# the header is skipped and the GPU0 *data* row is mistaken for it -- leaving only GPU0's pairs in
+# the matrix. On this node that passed the gate at world 2 and failed it at world 4, which reads as
+# a partially-connected box. The regression is kept as real captured output rather than a
+# hand-written fixture, because a hand-written one is exactly what missed this the first time.
+REAL_POD_MATRIX = (
+    "\t\x1b[4mGPU0\tGPU1\tGPU2\tGPU3\tNIC0\tNIC1\tNIC2\tNIC3\tNIC4\tNIC5\tNIC6\tNIC7"
+    "\tNIC8\tNIC9\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\x1b[0m\n"
+    "GPU0\t X \tNV12\tNV12\tNV12\tPXB\tPXB\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS"
+    "\t0-63\t0\t\tN/A\n"
+    "GPU1\tNV12\t X \tNV12\tNV12\tPXB\tPXB\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS"
+    "\t0-63\t0\t\tN/A\n"
+    "GPU2\tNV12\tNV12\t X \tNV12\tSYS\tSYS\tSYS\tSYS\tPXB\tPXB\tNODE\tNODE\tNODE\tNODE"
+    "\t64-127\t1\t\tN/A\n"
+    "GPU3\tNV12\tNV12\tNV12\t X \tSYS\tSYS\tSYS\tSYS\tPXB\tPXB\tNODE\tNODE\tNODE\tNODE"
+    "\t64-127\t1\t\tN/A\n"
+    "NIC0\tPXB\tPXB\tSYS\tSYS\t X \tPXB\tNODE\tNODE\tSYS\tSYS\tSYS\tSYS\tSYS\tSYS\n"
+    "NIC5\tSYS\tSYS\tPXB\tPXB\tSYS\tSYS\tSYS\tSYS\tPXB\t X \tNODE\tNODE\tNODE\tNODE\n"
+)
+
 # The subtle one: NVLink between two of four, PCIe for the rest. Passes at world 2, must fail at 4.
 MIXED_MATRIX = """\t GPU0\tGPU1\tGPU2\tGPU3\tCPU Affinity
 GPU0\t X \tNV4\tSYS\tSYS\t0-31
@@ -299,4 +320,29 @@ def test_empirical_gate_catches_a_link_that_declared_well_and_ran_badly() -> Non
 def test_gate_ignores_the_affinity_columns() -> None:
     """`0-31` in a CPU-affinity column must never be read as an interconnect class."""
     topo = parse_topo(NVLINK_MATRIX)
+    assert set(topo.matrix.values()) == {"NV12"}
+
+
+def test_parses_the_real_pod_matrix_ansi_escape_and_all() -> None:
+    """The regression. Every pair NVLink at world 4, not just the ones touching GPU0."""
+    topo = parse_topo(REAL_POD_MATRIX)
+
+    assert topo.non_nvlink_pairs(4) == []
+    assert topo.nvlink_width(4) == 12
+    check_declared(4, topo)
+
+
+def test_gpu0_data_row_is_never_mistaken_for_the_header() -> None:
+    """The precise failure: a header of [0] records GPU0's pairs and nothing else."""
+    topo = parse_topo(REAL_POD_MATRIX)
+
+    assert topo.link(1, 2) == "NV12"
+    assert topo.link(2, 3) == "NV12"
+    assert topo.link(1, 3) == "NV12"
+
+
+def test_nic_rows_and_columns_are_ignored() -> None:
+    """Ten NIC columns sit between the GPUs and the affinity columns on a real node."""
+    topo = parse_topo(REAL_POD_MATRIX)
+
     assert set(topo.matrix.values()) == {"NV12"}

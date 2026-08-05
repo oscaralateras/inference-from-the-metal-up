@@ -31,6 +31,9 @@ from dataclasses import dataclass, field
 # everything below traverses PCIe or worse and belongs to a different topic than this one.
 NVLINK_PATTERN = re.compile(r"^NV\d+$")
 
+# nvidia-smi underlines the header row with SGR escapes even when its output is being captured.
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
 # Below this, a large all-reduce is not running over NVLink whatever the matrix says. PCIe 4.0 x16
 # tops out near 25 GB/s each way and NVLink starts around 300; anything in between is a
 # renegotiated or partially-bonded link, which is equally not the thing being measured. Set well
@@ -86,22 +89,39 @@ def parse_topo(text: str) -> Topology:
     matrix: dict[tuple[int, int], str] = {}
     header: list[int] = []
 
+    # `nvidia-smi topo -m` underlines its header row with an ANSI escape, even when its output is
+    # captured rather than shown on a terminal. Stripping it is not cosmetic: with the escape left
+    # in, the header line's first cell is "\x1b[4mGPU0" rather than "GPU0", the real header is
+    # skipped, and the **GPU0 data row is mistaken for it**. That leaves a header of just [0], so
+    # only GPU0's pairs get recorded and every other pair reads as unknown. On a genuine 4x NV12
+    # node that passed the gate at world 2 and failed it at world 4, which looks exactly like a
+    # partially-connected box -- a wrong diagnosis that would have had us destroy a good pod.
+    text = ANSI_ESCAPE.sub("", text)
+
     for line in text.splitlines():
         cells = line.split()
         if not cells:
             continue
 
-        # The header row starts with the GPU columns and then trails off into `CPU Affinity`,
-        # `NUMA Affinity` and sometimes NIC columns, whose names vary by driver version. Take the
-        # leading run of `GPU<n>` tokens and stop at the first thing that is not one, rather than
-        # requiring the whole row to be GPUs — which is what an earlier version did, and it
-        # silently produced an empty matrix on every real node.
+        # The header row starts with the GPU columns and then trails off into NIC columns,
+        # `CPU Affinity` and `NUMA Affinity`, whose names vary by driver version. Take the leading
+        # run of `GPU<n>` tokens and stop at the first thing that is not one, rather than requiring
+        # the whole row to be GPUs -- which an earlier version did, and it silently produced an
+        # empty matrix on every real node.
+        #
+        # The `>= 2` is what separates the header from the GPU0 data row, since both begin with
+        # "GPU0": a header lists every GPU column, while a data row's second cell is its own "X".
+        # Belt and braces with the escape stripping above -- either alone fixes the observed bug,
+        # and the pair costs nothing.
         if not header and cells[0] == "GPU0":
+            run: list[int] = []
             for cell in cells:
                 if not (cell.startswith("GPU") and cell[3:].isdigit()):
                     break
-                header.append(int(cell[3:]))
-            continue
+                run.append(int(cell[3:]))
+            if len(run) >= 2:
+                header = run
+                continue
 
         row_label = cells[0]
         if not header or not row_label.startswith("GPU") or not row_label[3:].isdigit():
