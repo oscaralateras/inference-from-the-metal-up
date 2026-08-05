@@ -29,7 +29,8 @@ compute moves it. Batching is what escapes the wall.*
 
 ## Roadmap
 
-Eleven topics, built in order. Eight shipped; the rest are scoped and planned.
+Eleven topics, built in order. Eight shipped; T9's harness is written, tested and its bands
+registered, awaiting one multi-GPU session; T10 and T11 are scoped and planned.
 
 | | Topic | Language | Status |
 |---|---|---|---|
@@ -41,7 +42,7 @@ Eleven topics, built in order. Eight shipped; the rest are scoped and planned.
 | T6 | Performance reasoning | Python · GPU | ✅ shipped |
 | T7 | Roofline model & arithmetic intensity | Python · GPU | ✅ shipped |
 | T8 | GPU architecture: fused int4 GEMV | Triton · GPU | ✅ shipped |
-| T9 | Interconnects & multi-device | Python · multi-GPU | planned |
+| T9 | Interconnects & multi-device | Python · multi-GPU | 🔧 [harness ready](topics/t09_interconnects), bands registered |
 | T10 | OS & virtual memory | C + Python | planned |
 | T11 | Compiler / runtime layer | Python · GPU | planned |
 

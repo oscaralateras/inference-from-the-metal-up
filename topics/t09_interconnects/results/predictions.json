@@ -1,0 +1,34 @@
+{
+  "hidden": 3584,
+  "layers": 28,
+  "allreduces_per_token": 56,
+  "decode_bytes_by_batch": {
+    "1": 7168,
+    "8": 57344,
+    "32": 229376,
+    "128": 917504
+  },
+  "t5_prefill_bytes": 58720256,
+  "decode_vs_prefill_ratio": 8192.0,
+  "weight_share": 0.7371161275597703,
+  "t6_tokens_per_sec": 90.52904244508727,
+  "t6_step_ms": 11.046178916634139,
+  "alpha_scaling_2_to_4": 3.0,
+  "assumed_alpha_us": 8.0,
+  "assumed_beta_gbps": 480.0,
+  "assumed_comms_us_per_token": {
+    "2": 448.8362666666667,
+    "4": 1345.2544
+  },
+  "assumed_tp_speedup": {
+    "2": 1.4879299413540072,
+    "4": 1.757631425149451
+  },
+  "bands": {
+    "alpha_scaling_tolerance": 0.3,
+    "min_share_of_link_spec": 0.7,
+    "min_decode_alpha_share": 0.9,
+    "tp_model_tolerance": 1.5
+  },
+  "session_id": ""
+}

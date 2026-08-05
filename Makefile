@@ -1,4 +1,5 @@
-.PHONY: setup lint format format-check type test ci probe t6 t7 t8 t8-predict t8-ceiling
+.PHONY: setup lint format format-check type test ci probe t6 t7 t8 t8-predict t8-ceiling \
+        t9 t9-predict t9-tp t9-rehearse
 
 # GPU topics. Run `make probe` once per pod first — T6, T7 and T8 all read their ceilings from the
 # hardware profile it writes, and a cross-topic test asserts they came from the same session.
@@ -34,6 +35,26 @@ t8: ; uv run python -m topics.t08_gpu_architecture.measure && uv run python -m t
 t8-predict: ; uv run python -m topics.t08_gpu_architecture.measure --skip-kernel
 t8-ceiling: ; uv run python -m topics.t08_gpu_architecture.probe_ceiling
 
+
+# T9 — interconnects. Needs a MULTI-GPU NVLink node; `t9` refuses to run on anything else, and
+# that refusal is the point (see topology.py). Order matters here too:
+#
+#   1. t9-predict   registers the bands before any hardware exists. Runs on a laptop. Do this
+#                   first — a band invented after seeing the data is not a band.
+#   2. t9-rehearse  the identical harness over gloo on CPU. Exercises every code path except the
+#                   NCCL calls, so nothing is debugged at $6/hr. Its numbers are never published.
+#   3. t9           topology gate, then the sweep, then the fit, then the plots. On the pod.
+#   4. t9-tp        stage 3, the stretch: a real row-parallel layer, scoring band (4).
+t9-predict: ; uv run python -m topics.t09_interconnects.predict --write
+t9-rehearse:
+	uv run python -m topics.t09_interconnects.measure --backend gloo --world-sizes 2,4 \
+	    --max-bytes 16777216
+	uv run python -m topics.t09_interconnects.tp_matmul --backend gloo --world-sizes 1,2,4 \
+	    --hidden 512 --intermediate 2048
+t9:
+	uv run python -m topics.t09_interconnects.measure --backend nccl --world-sizes 2,4
+	uv run python -m topics.t09_interconnects.plot
+t9-tp: ; uv run python -m topics.t09_interconnects.tp_matmul --backend nccl --world-sizes 1,2,4
 
 setup: ; uv sync
 lint: ; uv run ruff check .

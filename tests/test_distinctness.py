@@ -202,3 +202,83 @@ def test_lab_note_numbers_match_the_results(csv_path, note, claims) -> None:
     text = note.read_text()
     for label, value in claims(read_rows(csv_path)).items():
         assert value in text, f"{note.name} no longer quotes the measured {label}: {value}"
+
+
+# ---------------------------------------------------------------------------------------------
+# T5 vs T9 — the other pair close enough to collide
+# ---------------------------------------------------------------------------------------------
+#
+# Both run NCCL collectives on a multi-GPU node, both concern tensor parallelism, and both were
+# measured on 4x A100 NVLink. The split is by *regime*, and it is the reason T9 exists at all:
+#
+# * **T5 owns the strategy domain.** Five ways to split a transformer, compared on throughput,
+#   bytes communicated and bytes held per rank. It runs at batch 16 x seq 512, so its collectives
+#   carry tens of megabytes and sit far out in the bandwidth-bound regime.
+# * **T9 owns the cost structure of one collective.** No strategies, no throughput comparison: a
+#   single all-reduce, swept across six decades of message size and fitted to `alpha + n/beta`.
+#   Its operating point of interest is decode at batch 1 — kilobytes, entirely latency-bound.
+#
+# T5 ended on an unresolved observation: TP's bandwidth cost is only ~4% of its step, yet TP
+# scales worst of the three dense strategies, so "the loss is frequency and shape, not volume".
+# T9 measures that fixed per-call cost directly. The topics compose; they do not overlap.
+
+T5_METRICS = {
+    "comms_bytes_per_step",
+    "efficiency",
+    "load_factor",
+    "max_rel_err",
+    "predicted_efficiency",
+    "recovered_p",
+    "tokens_per_s",
+    "wall_seconds",
+    "weight_bytes_per_rank",
+}
+T9_METRICS = {
+    "allreduce_us",
+    "bus_gbps",
+    "alpha_us",
+    "alpha_step_us",
+    "beta_gbps",
+    "fit_r_squared",
+    "crossover_bytes",
+    "alpha_share",
+    "comms_us_per_token",
+    "matmul_us",
+    "full_us",
+    "comms_us",
+    "comms_share",
+    "measured_over_predicted",
+}
+
+
+def test_t5_and_t9_metric_vocabularies_do_not_overlap() -> None:
+    """`speedup` is deliberately shared — both report one, and it is the same quantity."""
+    assert not (T5_METRICS & T9_METRICS)
+
+
+def test_t5_and_t9_measure_opposite_ends_of_the_same_curve() -> None:
+    """The regime split, as arithmetic rather than as a paragraph.
+
+    If these two operating points were ever within an order of magnitude of each other, T9 would
+    be re-measuring T5 and should be deleted rather than published.
+    """
+    from topics.t09_interconnects.model import (
+        DEFAULT_HIDDEN,
+        allreduce_bytes,
+        prefill_allreduce_bytes,
+    )
+    from topics.t09_interconnects.predict import T5_BATCH, T5_SEQ
+
+    t5_payload = prefill_allreduce_bytes(T5_BATCH, T5_SEQ, DEFAULT_HIDDEN)
+    t9_payload = allreduce_bytes(1, DEFAULT_HIDDEN)
+
+    assert t5_payload / t9_payload > 1000
+
+
+def test_t9_reports_only_interconnect_metrics() -> None:
+    from topics.t09_interconnects.measure import CSV_PATH as T9_CSV
+
+    if not T9_CSV.exists():
+        pytest.skip("T9 has not been run in this session")
+    seen = {r["metric"] for r in read_rows(T9_CSV)}
+    assert seen <= (T9_METRICS | {"tp_speedup"})
