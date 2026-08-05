@@ -175,14 +175,23 @@ it*. World size 1 is the control: identical code path, no collective.
 
 ## Reproduce
 
+Off the clock, on any machine:
+
 ```bash
 uv sync
 make t9-predict     # register the bands — laptop, no GPU
 make t9-rehearse    # identical harness over gloo on CPU; numbers not published
-uv run pytest topics/t09_interconnects tests    # 32 unit tests + distinctness, no GPU
+uv run pytest topics/t09_interconnects tests    # unit tests + distinctness, no GPU
+```
 
-# on a 4x A100 NVLink node, on-demand:
-make probe          # once per pod
-make t9             # topology gate -> sweep -> fit -> plots
-make t9-tp          # stage 3, band (4)
+On a 4x A100 SXM NVLink pod, on-demand. `scripts/t9_session.sh` is the whole session; run `gate`
+on its own first, because it needs nothing but `nvidia-smi` and so decides whether the pod is
+worth keeping before anything has been downloaded onto it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/oscaralateras/inference-from-the-metal-up/main/scripts/t9_session.sh -o t9.sh
+bash t9.sh gate     # ~30s. If this fails, destroy the pod and re-rent.
+bash t9.sh setup    # clone + uv sync + make probe (~20 min)
+bash t9.sh run      # stages 1-2
+bash t9.sh tp       # stage 3
 ```
