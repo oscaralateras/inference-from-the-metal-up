@@ -1,6 +1,6 @@
 .PHONY: setup lint format format-check type test ci probe t6 t7 t8 t8-predict t8-ceiling \
         t9 t9-predict t9-tp t9-rehearse t9-launch t9-launch-graphs t9-vllm \
-        t10 t10-predict t10-rehearse
+        t10 t10-predict t10-rehearse t11 t11-predict t11-rehearse t11-control
 
 # GPU topics. Run `make probe` once per pod first — T6, T7 and T8 all read their ceilings from the
 # hardware profile it writes, and a cross-topic test asserts they came from the same session.
@@ -85,6 +85,19 @@ t10-rehearse:
 t10:
 	uv run python -m topics.t10_os_virtual_memory.measure --gib 8
 	uv run python -m topics.t10_os_virtual_memory.plot
+
+# T11 — fusion vs launch. Needs a GPU; `t11-control` is band 3's falsification run and roughly
+# doubles the session, which is why it is a separate target rather than a default.
+#
+# `t11-predict` needs a bandwidth to predict against. On a pod it reads the session probe; on a
+# laptop pass --bandwidth explicitly so the bands can be filed before any hardware exists.
+t11-predict: ; uv run python -m topics.t11_compiler_runtime.predict --write
+t11-rehearse:
+	uv run python -m topics.t11_compiler_runtime.measure --device cpu --hidden 512 --batches 1,8,32
+t11:
+	uv run python -m topics.t11_compiler_runtime.measure
+	uv run python -m topics.t11_compiler_runtime.plot
+t11-control: ; uv run python -m topics.t11_compiler_runtime.measure --chain-lengths 2,3
 
 setup: ; uv sync
 lint: ; uv run ruff check .

@@ -44,6 +44,12 @@ dev = [
     "pyright>=1.1.380",
     "pytest>=8.0",
     "pre-commit>=3.8",
+    # T11's rehearsal. `torch.compile` on CPU builds a C++ wrapper through Inductor, which imports
+    # setuptools at codegen time and is not declared by torch itself — so the CPU rehearsal died
+    # with ModuleNotFoundError while the GPU path (Triton) would have worked. A rehearsal that
+    # cannot run is worse than none: it means the first execution of this code is the one being
+    # paid for by the hour, which is precisely what T9 established the rehearsal step to prevent.
+    "setuptools>=70",
 ]
 
 [tool.uv]
