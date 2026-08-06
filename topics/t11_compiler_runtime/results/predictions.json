@@ -1,0 +1,65 @@
+{
+  "hidden": 3584,
+  "chain_ops": [
+    "rmsnorm",
+    "residual_add",
+    "silu",
+    "gate_mul",
+    "rotary_half"
+  ],
+  "batches": [
+    1,
+    8,
+    32,
+    128,
+    512,
+    2048
+  ],
+  "fusion_ceiling": 3.3333333333333335,
+  "unfused_bytes_by_batch": {
+    "1": 71680,
+    "8": 573440,
+    "32": 2293760,
+    "128": 9175040,
+    "512": 36700160,
+    "2048": 146800640
+  },
+  "fused_bytes_by_batch": {
+    "1": 21504,
+    "8": 172032,
+    "32": 688128,
+    "128": 2752512,
+    "512": 11010048,
+    "2048": 44040192
+  },
+  "peak_bandwidth_gbps": 1737.086527490226,
+  "assumed_launch_us": 5.0,
+  "predicted_crossover_batch": 173.09934306144632,
+  "predicted_fused_us_by_batch": {
+    "1": 0.012379348788726931,
+    "8": 0.09903479030981545,
+    "32": 0.3961391612392618,
+    "128": 1.5845566449570472,
+    "512": 6.338226579828189,
+    "2048": 25.352906319312755
+  },
+  "predicted_unfused_us_by_batch": {
+    "1": 0.0412644959624231,
+    "8": 0.3301159676993848,
+    "32": 1.3204638707975391,
+    "128": 5.2818554831901565,
+    "512": 21.127421932760626,
+    "2048": 84.5096877310425
+  },
+  "bands": {
+    "max_fusion_speedup_at_batch_1": 1.1,
+    "min_graph_speedup_at_batch_1": 2.0,
+    "crossover_batch_range": [
+      64,
+      512
+    ],
+    "min_share_of_memory_roof": 0.7,
+    "fusion_model_tolerance": 1.5
+  },
+  "session_id": "7e6c8b9fba8e"
+}

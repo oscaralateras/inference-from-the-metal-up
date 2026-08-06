@@ -4,11 +4,10 @@ The measurement needs a GPU, so what is tested here is everything it *decides wi
 arithmetic that predicts fusion's ceiling, the derivation that places the crossover, the chain
 itself (which runs identically on CPU), and the crossover locator.
 
-The derivation tests are the important ones, because the crossover formula is the topic's headline
-and it was wrong once already: an earlier version claimed the crossover does not depend on chain
-length, having cancelled `ops` from an equation where it does not cancel. Fusion removes `2k-3`
-round trips while capture removes `k` launches, and those scale differently. The tests below pin
-that down so the claim cannot silently regress to the wrong one.
+The derivation tests pin the model as it was *registered*, which is not the same as pinning it as
+correct — the measurement refuted its chain-length scaling, and the lab-note tests at the bottom of
+this file pin that refutation so it cannot be quietly softened later. Both are kept deliberately: a
+repo that edits its model to match the data afterwards has no pre-registration at all.
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from arch_common.results_io import read_rows, select
 from topics.t11_compiler_runtime.chain import (
     BOUNDARY_READS,
     BOUNDARY_WRITES,
@@ -244,3 +244,159 @@ def test_the_four_modes_are_the_two_by_two() -> None:
     assert set(MODES) == {"eager", "compile", "graph", "compile_graph"}
     assert sum(m.startswith("compile") for m in MODES) == 2
     assert sum(m.endswith("graph") for m in MODES) == 2
+
+
+# ---------------------------------------------------------------------------------------------
+# The lab note, checked against the data it claims to describe
+# ---------------------------------------------------------------------------------------------
+
+
+def _results() -> list[dict[str, str]]:
+    from topics.t11_compiler_runtime.measure import CSV_PATH
+
+    if not CSV_PATH.exists():
+        pytest.skip("T11 has not been run in this session")
+    rows = read_rows(CSV_PATH)
+    if {r["session_id"] for r in rows} == {"rehearsal"}:
+        pytest.skip("T11 holds rehearsal numbers, not measured ones")
+    return rows
+
+
+def _at(rows: list[dict[str, str]], exp: str, variant: str, metric: str, x: int) -> float:
+    hits = [v for xx, v in select(rows, exp, variant, metric) if int(xx) == x]
+    assert len(hits) == 1, f"expected one {exp}/{variant}/{metric} at x={x}, found {len(hits)}"
+    return hits[0]
+
+
+# (batch, fusion speedup, graph speedup, combined) — the note's headline table.
+QUOTED_SPEEDUPS = [
+    (1, 1.48, 5.50, 16.4),
+    (8, 1.88, 5.01, 20.2),
+    (32, 1.85, 3.91, 19.4),
+    (128, 1.85, 3.50, 19.0),
+    (512, 1.84, 2.18, 11.9),
+    (2048, 2.72, 1.07, 4.7),
+]
+
+
+@pytest.mark.parametrize(("batch", "fusion", "graphs", "both"), QUOTED_SPEEDUPS)
+def test_lab_note_speedup_table(batch: int, fusion: float, graphs: float, both: float) -> None:
+    rows = _results()
+    assert _at(rows, "mechanism", "chain", "fusion_speedup", batch) == pytest.approx(
+        fusion, rel=0.01
+    )
+    assert _at(rows, "mechanism", "chain", "graph_speedup", batch) == pytest.approx(
+        graphs, rel=0.01
+    )
+    assert _at(rows, "mechanism", "chain", "combined_speedup", batch) == pytest.approx(
+        both, rel=0.01
+    )
+
+
+def test_lab_note_the_mechanisms_swap_dominance() -> None:
+    """The topic's whole claim: capture leads at batch 1, fusion leads at 2048."""
+    rows = _results()
+    assert _at(rows, "mechanism", "chain", "graph_speedup", 1) > _at(
+        rows, "mechanism", "chain", "fusion_speedup", 1
+    )
+    assert _at(rows, "mechanism", "chain", "fusion_speedup", 2048) > _at(
+        rows, "mechanism", "chain", "graph_speedup", 2048
+    )
+
+
+def test_lab_note_crossover_and_the_remodelled_prediction() -> None:
+    """The note quotes a crossover at 648, a measured launch cost of 23.15 us, and a remodelled
+    prediction of 801 — 24% out, against the 3.7x the assumed 5 us input was out by."""
+    rows = _results()
+    cross = _at(rows, "crossover", "chain", "crossover_batch", 5)
+    launch = _at(rows, "crossover", "chain", "measured_launch_us", 5)
+    remodelled = _at(rows, "crossover", "chain", "remodelled_crossover_batch", 5)
+
+    assert cross == pytest.approx(648, rel=0.01)
+    assert launch == pytest.approx(23.15, rel=0.01)
+    assert remodelled == pytest.approx(801, rel=0.01)
+    # The remodelled prediction must beat the originally registered one, or the note's claim that
+    # "the structure survived, the input did not" is not supported.
+    from topics.t11_compiler_runtime.predict import build_prediction
+
+    registered = build_prediction(1737.1).predicted_crossover_batch
+    assert abs(remodelled - cross) / cross < abs(registered - cross) / cross
+
+
+def test_lab_note_the_chain_length_control_refutes_the_scaling_prediction() -> None:
+    """The most important failure in the topic, pinned so it cannot be quietly softened.
+
+    The model predicted the crossover moves by (2*5-3)/(2*k-3) as the chain shortens: 2.33x at
+    3 ops and 7.00x at 2. Measured: 0.97x and 1.16x. Refuted, not marginally.
+    """
+    rows = _results()
+    five = _at(rows, "crossover", "chain", "crossover_batch", 5)
+    three = _at(rows, "crossover", "chain_ops3", "crossover_batch", 3)
+    two = _at(rows, "crossover", "chain_ops2", "crossover_batch", 2)
+
+    assert three == pytest.approx(631, rel=0.01)
+    assert two == pytest.approx(748, rel=0.01)
+
+    for measured, ops in ((three, 3), (two, 2)):
+        predicted_shift = (2 * 5 - 3) / (2 * ops - 3)
+        actual_shift = measured / five
+        assert actual_shift < predicted_shift / 2, (
+            f"at {ops} ops the model predicted a {predicted_shift:.2f}x shift and the note reports "
+            f"the measured {actual_shift:.2f}x as a refutation — this test keeps that true"
+        )
+
+    # And the empirical claim that replaced it: the crossover is insensitive to chain length.
+    assert max(five, three, two) / min(five, three, two) < 1.25
+
+
+def test_lab_note_band_4_fails_because_the_five_op_chain_does_not_fully_fuse() -> None:
+    """The kernel counts are the evidence, and they need no timer to read."""
+    rows = _results()
+
+    assert _at(rows, "modes", "eager", "kernel_launches", 2048) == 11
+    assert _at(rows, "modes", "compile", "kernel_launches", 2048) == 2, (
+        "the 5-op chain emits TWO kernels — the note's explanation for band 4 depends on this"
+    )
+    for variant in ("compile_ops2", "compile_ops3"):
+        assert _at(rows, "modes", variant, "kernel_launches", 2048) == 1, (
+            f"{variant} should fuse to a single kernel"
+        )
+
+
+def test_lab_note_fused_bandwidth_by_chain_length() -> None:
+    """91.7% / 80.1% / 47.9% of roof at 2, 3 and 5 ops — the shorter chains would pass band 4."""
+    from topics.t11_compiler_runtime.predict import MIN_SHARE_OF_MEMORY_ROOF
+
+    rows = _results()
+    roof = 1737.1
+    shares = {}
+    for suffix, ops in (("_ops2", 2), ("_ops3", 3), ("", 5)):
+        us = _at(rows, "modes", f"compile_graph{suffix}", "latency_us", 2048)
+        shares[ops] = fused_bytes(2048, DEFAULT_HIDDEN) / (us * 1e-6) / 1e9 / roof
+
+    assert shares[2] == pytest.approx(0.917, abs=0.01)
+    assert shares[3] == pytest.approx(0.801, abs=0.01)
+    assert shares[5] == pytest.approx(0.479, abs=0.01)
+
+    assert shares[2] >= MIN_SHARE_OF_MEMORY_ROOF and shares[3] >= MIN_SHARE_OF_MEMORY_ROOF
+    assert shares[5] < MIN_SHARE_OF_MEMORY_ROOF
+
+
+def test_lab_note_band_4_as_registered_and_as_diagnosed() -> None:
+    """The band stays failed as registered; the diagnostic is reported beside it, not instead."""
+    rows = _results()
+    roof = 1737.1
+    registered = _at(rows, "mechanism", "chain", "fused_gbps", 2048) / roof
+    diagnosed = _at(rows, "mechanism", "chain", "graphed_fused_gbps", 2048) / roof
+
+    assert registered == pytest.approx(0.276, abs=0.005)
+    assert diagnosed == pytest.approx(0.479, abs=0.005)
+    assert diagnosed > registered
+
+
+def test_lab_note_compile_is_host_bound() -> None:
+    """The note's caveat, as data: 2,048x the work costs `compile` less time, not more."""
+    rows = _results()
+    assert _at(rows, "modes", "compile", "latency_us", 2048) <= _at(
+        rows, "modes", "compile", "latency_us", 1
+    )

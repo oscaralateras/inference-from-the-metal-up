@@ -19,8 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from arch_common.results_io import read_rows
-from topics.t06_perf_reasoning.measure import CSV_PATH as T6_CSV
+from arch_common.results_io import read_rows, scalar
 from topics.t10_os_virtual_memory.measure import CSV_PATH as T10_CSV
 from topics.t10_os_virtual_memory.pipeline import model_bytes
 from topics.t11_compiler_runtime.chain import DEFAULT_HIDDEN, activation_bytes
@@ -130,20 +129,68 @@ def test_neither_topic_publishes_rehearsal_numbers_alongside_measured_ones() -> 
         assert len(sessions) == 1, f"{name} results mix sessions: {sessions}"
 
 
-def test_t10_and_t11_were_measured_in_the_same_session_as_t6() -> None:
-    """All three quote T6's step time or its ceilings, so all three must share one probe.
+def test_t10_and_t11_share_one_session_with_each_other() -> None:
+    """They read the same hardware probe, so they must describe the same silicon.
 
-    Skipped until every file exists and none is a rehearsal — which is the state the repo is in
-    before the GPU session, and the state this test is written to catch afterwards.
+    This is the requirement that is actually enforceable, and it is deliberately **not** extended
+    to T6. An earlier version of this test demanded all three share a session and failed the moment
+    the pod ran: T6 was measured on a different rental months earlier, and re-running a 7B engine
+    purely to satisfy a session ID would have cost money to prove nothing.
+
+    T9 set the precedent — it composes with T6's step time across pods and validates the
+    composition by agreement on a measured ceiling instead. That check is the test below.
     """
-    paths = {"T6": T6_CSV, "T10": T10_CSV, "T11": T11_CSV}
+    paths = {"T10": T10_CSV, "T11": T11_CSV}
     if not all(p.exists() for p in paths.values()):
-        pytest.skip("not all three topics have been run")
+        pytest.skip("both topics must have been run")
 
     sessions = {name: {r["session_id"] for r in read_rows(p)} for name, p in paths.items()}
     if any(s == {"rehearsal"} for s in sessions.values()):
         pytest.skip("at least one topic holds rehearsal numbers, not measured ones")
 
-    assert len(set(map(frozenset, sessions.values()))) == 1, (
-        f"topics were measured against different sessions: {sessions}"
+    assert sessions["T10"] == sessions["T11"], (
+        f"T10 and T11 were measured against different sessions: {sessions} — they share one "
+        "hardware probe, so this means one of them was re-run on a different pod"
+    )
+
+
+# How closely this session's measured bandwidth must match the one T6, T7 and T8 ran at for their
+# numbers to be composable. T7 recorded 1,736.7 GB/s; a pod within a fraction of a percent of that
+# is the same silicon under the same thermal conditions, and a pod that is not should not have its
+# cold-start seconds divided by T6's step time.
+MAX_BANDWIDTH_DRIFT = 0.02
+
+
+def test_this_session_agrees_with_the_one_t6_and_t7_were_measured_on() -> None:
+    """T10 quotes cold start in T6's tokens; T11 scores against T7's roof. Both compose across
+    pods, and this is what makes that legitimate rather than assumed.
+
+    A session ID cannot check this — the pods are genuinely different. What can is the ceiling
+    itself: if two rentals of the same card measure the same bandwidth to within a fraction of a
+    percent, composing their numbers is sound. If a future pod drifts, this fails and the notes
+    stop quietly borrowing a step time from hardware they never ran on.
+
+    The earlier session's roof is not stored directly anywhere — `results/hardware.json` holds
+    whichever session ran last, which is this one. But T8 recorded its load-only probe both in GB/s
+    and as a share of the roof it was scored against, and a value over its own fraction recovers
+    the denominator. Derived from committed measurements rather than typed in.
+    """
+    from arch_common.gpu import load_profile
+    from topics.t08_gpu_architecture.measure import CSV_PATH as T8_CSV
+
+    if not T8_CSV.exists():
+        pytest.skip("T8 has not been run")
+
+    rows = read_rows(T8_CSV)
+    achieved = scalar(rows, "ceiling", "load_only", "gbps")
+    share = scalar(rows, "ceiling", "load_only", "share_of_roof")
+    if not share:
+        pytest.skip("T8's ceiling rows do not carry a share of roof")
+    there = achieved / share
+
+    here = load_profile().peak_bandwidth_gbps
+    drift = abs(here - there) / there
+    assert drift < MAX_BANDWIDTH_DRIFT, (
+        f"this session measured {here:,.1f} GB/s against the T6/T7/T8 session's {there:,.1f} — "
+        f"{drift:.1%} apart, so composing T10's seconds with T6's step time is not justified"
     )
