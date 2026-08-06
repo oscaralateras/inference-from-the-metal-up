@@ -450,3 +450,55 @@ def test_lab_note_cold_start_in_tokens() -> None:
     assert total == pytest.approx(6.02, rel=0.01)
     assert tokens == pytest.approx(545, rel=0.01)
     assert stages == pytest.approx(total, rel=0.001), "the stage times must add up to the total"
+
+
+def test_lab_note_the_pipelined_floor_is_the_slowest_stage() -> None:
+    """The note reports 4.28-6.02 s rather than 6.02 alone.
+
+    Band 1 measured the runtime overlapping a staging copy with the previous chunk's DMA, so a
+    serial sum of the stages is an upper bound. The floor is whichever stage is slowest. A note
+    that proves pipelining and then quotes only the serial sum contradicts itself.
+    """
+    rows = _results()
+    stages = [
+        [v for _, v in select(rows, "coldstart", name, "stage_seconds")][0]
+        for name in ("storage_read", "host_memcpy", "h2d_pinned")
+    ]
+
+    assert max(stages) == pytest.approx(4.28, rel=0.01)
+    assert max(stages) < sum(stages), "a floor equal to the sum would mean nothing overlaps"
+
+
+def test_lab_note_the_real_checkpoint_was_measured_not_extrapolated() -> None:
+    """The note quotes 5.63 s mapped and 14.96 s copied on Qwen2.5-7B's actual shards."""
+    rows = _results()
+    mapped = [v for _, v in select(rows, "checkpoint", "mapped", "load_seconds")][0]
+    copied = [v for _, v in select(rows, "checkpoint", "copied", "load_seconds")][0]
+
+    assert mapped == pytest.approx(5.63, rel=0.02)
+    assert copied == pytest.approx(14.96, rel=0.02)
+    assert copied / mapped == pytest.approx(2.66, rel=0.03), "the note quotes 2.66x"
+
+
+def test_lab_note_the_real_load_is_slower_than_the_per_byte_model() -> None:
+    """339 tensors moved one at a time cost more than the stage rates predict.
+
+    This is the note's claim that the per-byte model is a floor. If a real mapped load ever came
+    in at or below the staged mapped estimate, that paragraph would be wrong.
+    """
+    rows = _results()
+    mapped = [v for _, v in select(rows, "checkpoint", "mapped", "load_seconds")][0]
+    memcpy = [v for _, v in select(rows, "coldstart", "host_memcpy", "stage_seconds")][0]
+    h2d = [v for _, v in select(rows, "coldstart", "h2d_pinned", "stage_seconds")][0]
+
+    # The mapped stage-1 rate is the measured cold mmap total over the synthetic payload's size,
+    # applied to the model's bytes — the same extrapolation the note's staged table performs.
+    payload_bytes = [x for x, _ in select(rows, "load", "mmap_cold", "total_seconds")][0]
+    model_total_bytes = [x for x, _ in select(rows, "coldstart", "total", "cold_start_seconds")][0]
+    mapped_gbps = payload_bytes / _load(rows, "mmap_cold", "total_seconds") / 1e9
+
+    storage_seconds = model_total_bytes / (mapped_gbps * 1e9)
+    staged_serial = storage_seconds + memcpy + h2d
+
+    assert mapped > staged_serial, "the real load must exceed the staged estimate, not undercut it"
+    assert mapped / max(storage_seconds, memcpy, h2d) == pytest.approx(4.6, rel=0.1)

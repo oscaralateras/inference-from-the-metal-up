@@ -128,12 +128,62 @@ pre-registration guessed 6.45 s and 584 tokens from assumed rates — 6.7% out, 
 than judgement: it assumed storage at 3.0 GB/s (measured 3.56), memcpy at 20 (measured 13.2) and
 H2D at 25 (measured 26.2). Two errors in opposite directions.
 
+**That 6.02 s is an upper bound, not an estimate**, and band 1 above is why. The runtime overlaps
+each staging copy with the previous chunk's DMA — that is exactly how pageable H2D beat its serial
+bound by 2.15×. Stages pipeline. A loader that reads chunk *n+1* while chunk *n* transfers pays the
+**slowest stage, not the sum**, so the floor is storage alone at **4.28 s = 388 tokens**. Summing
+serially here while proving overlap two sections earlier would be the note contradicting itself.
+
+The staged range is therefore **4.28–6.02 s = 388–545 tokens** for the copying loader. Run the same
+arithmetic with a mapped stage 1 at 12.38 GB/s instead of 3.56 and it becomes **1.23–2.96 s =
+111–268 tokens**, which is the loader choice worth roughly 400 tokens on its own.
+
 **The actionable version:** stage 1 dominates, and stage 1's rate is a property of the *loader*, not
 of the disk. The same storage delivers 12.4 GB/s to a memory-mapped read and 3.56 GB/s to a copying
 one. Choosing the loader is worth more here than any amount of cache warming.
 
-And in serving terms: 545 tokens is the price of a cold start. If your traffic gap is worth less
-than that, scale-to-zero costs more than it saves.
+And in serving terms: a cold start costs hundreds of tokens. If your traffic gap is worth less than
+that, scale-to-zero costs more than it saves.
+
+## Measured, on the real checkpoint
+
+Everything above is arithmetic on rates measured from one synthetic file. Qwen2.5-7B's actual
+`safetensors` shards — four files, 15.23 GB, 339 tensors — evicted and loaded cold on the same pod,
+same session:
+
+| path | time | rate | tokens |
+|---|---|---|---|
+| mapped (`safetensors` → device) | **5.63 s** | 2.71 GB/s | **510** |
+| copied (`readinto` → device) | **14.96 s** | 1.02 GB/s | **1,354** |
+
+**The mapped loader is 2.66× faster on the real thing.** That is the note's central recommendation
+measured rather than inferred, and it is the one number here a serving stack can act on directly.
+
+The more interesting result is the gap to the arithmetic. On stage rates a mapped load should take
+1.23–2.96 s. It takes **5.63** — between 1.9× and 4.6× worse than the model. The checkpoint is 339
+separate tensors, each moved by its own synchronous, unpinned transfer, and nothing overlaps
+anything. **The per-byte model is a floor, and a straightforward real loader gives most of the
+margin back in per-tensor overhead.**
+
+And a warning against reading agreement into a coincidence: the measured 5.63 s sits close to the
+extrapolated 6.02 s, but those two numbers describe different things. The extrapolation is a
+*copying* pipeline; the measurement is a *mapped* one that should have been ~3× quicker and was not.
+The stage rates transferred. The end-to-end estimate matching was luck.
+
+## What transfers to a slower box
+
+Three of the four failed bands are one hardware fact, and the fact is quantifiable rather than
+anecdotal. The copy runs at a fixed **6.25 GB/s** however fast storage gets; `mmap` tracks storage
+directly. Feeding that into the same two-stage model that held to 15% above:
+
+| band | passes only when storage is | this box |
+|---|---|---|
+| 3 — `mmap`/`read` cold ≤ 1.2× | **≤ 1.25 GB/s** | 12.38 GB/s |
+| 4 — cold/warm read ≥ 3× | **≤ 3.13 GB/s** | 12.38 GB/s |
+
+So on a 2 GB/s network volume band 4 would have passed and band 3 would not; below ~1.25 GB/s both
+would. **The bands were not wrong about the mechanism — they were written for a slower disk than the
+one that turned up**, and the thresholds say exactly how much slower.
 
 ## Why this is not any other topic
 
@@ -189,12 +239,18 @@ the model, not the measurement.
 
 ## Caveats
 
-- **The payload is synthetic and 8 GiB; the model-scale numbers are extrapolated.** Per-byte rates
-  are what generalise, but a real checkpoint is many files with metadata between them, and
-  `safetensors` mmaps rather than copying — which this note suggests is the right choice.
-- **One storage device, and a fast one.** Three of the four failed bands trace to that. On a slower
-  disk band 3 and band 4 would likely pass, which is a statement about the hardware and not about
-  the mechanism. The mechanism — mmap is zero-copy, the copy costs 6.25 GB/s — is what transfers.
+- **The band measurements use a synthetic 8 GiB payload; the real checkpoint is measured
+  separately.** Per-byte rates are what generalise, and the checkpoint run above shows what they
+  miss: a real load is 339 tensors with per-tensor transfer cost the single-file model has no term
+  for. The staged numbers should be read as a floor.
+- **The checkpoint loaders are the straightforward spelling, not a tuned one.** Neither pins host
+  memory, batches small tensors, nor overlaps transfer with reading. A serving stack that does all
+  three should beat 5.63 s; the gap to the 1.23 s floor is the size of that opportunity, not a claim
+  that it is unreachable.
+- **One storage device, and a fast one.** Three of the four failed bands trace to that, and "What
+  transfers to a slower box" above puts numbers on it: below 3.13 GB/s band 4 passes, below
+  1.25 GB/s band 3 does too. That is a statement about the hardware and not about the mechanism.
+  The mechanism — mmap is zero-copy, the copy costs 6.25 GB/s — is what transfers.
 - **Stage 1's rate depends on the loader**, so the cold-start table's 71% is the copying loader's
   share. With a mapped loader stage 1 would be ~1.2 s, not 4.28.
 - **Pinning cost is excluded.** `cudaHostAlloc` on a multi-gigabyte buffer is not free; this
@@ -221,6 +277,10 @@ which shares one pod and one hardware probe with T11:
 bash s.sh gate      # 1 GPU, a way to evict the page cache, enough disk. ~10s.
 bash s.sh setup     # clone + uv sync + make probe
 bash s.sh t10       # cold/warm x read/mmap, then H2D, then the bands
+
+# and the real checkpoint, once a model is on the container's NVMe
+hf download Qwen/Qwen2.5-7B --local-dir /root/models/qwen2.5-7b
+uv run python -m topics.t10_os_virtual_memory.checkpoint --model-dir /root/models/qwen2.5-7b
 ```
 
 **Put the weight file on the container's NVMe, not `/workspace`.** RunPod mounts `/workspace` as

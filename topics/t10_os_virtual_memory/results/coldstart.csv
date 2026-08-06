@@ -61,3 +61,9 @@ session_id,experiment,variant,x,metric,value
 7e6c8b9fba8e,coldstart,h2d_pinned,15231233024,stage_seconds,0.5802628403824219
 7e6c8b9fba8e,coldstart,total,15231233024,cold_start_seconds,6.015923864172217
 7e6c8b9fba8e,coldstart,total,15231233024,tokens_foregone,544.61582684606
+7e6c8b9fba8e,checkpoint,mapped,15231271888,load_seconds,5.628580276854336
+7e6c8b9fba8e,checkpoint,mapped,15231271888,load_gbps,2.7060523746340404
+7e6c8b9fba8e,checkpoint,mapped,15231271888,tokens_foregone,509.54998278892725
+7e6c8b9fba8e,checkpoint,copied,15231271888,load_seconds,14.956838875077665
+7e6c8b9fba8e,checkpoint,copied,15231271888,load_gbps,1.0183483298318883
+7e6c8b9fba8e,checkpoint,copied,15231271888,tokens_foregone,1354.0283013662372
