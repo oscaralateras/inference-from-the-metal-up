@@ -67,12 +67,18 @@ def evict_file(path: Path) -> bool:
     whether the call was even possible; `posix_fadvise` is Linux-only, so macOS gets False and the
     caller falls back or refuses.
     """
-    if not hasattr(os, "posix_fadvise"):
+    # Looked up dynamically rather than called directly, because `posix_fadvise` does not exist on
+    # macOS and typed access to it fails the type check on the authoring machine — a real CI
+    # failure for a call that is correct on the machine it runs on. Same class of problem as the
+    # platform-marked Triton and vLLM dependencies.
+    fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if fadvise is None or dontneed is None:
         return False
 
     os.sync()
     with path.open("rb") as f:
-        os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        fadvise(f.fileno(), 0, 0, dontneed)
     return True
 
 
