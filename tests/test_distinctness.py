@@ -255,14 +255,13 @@ T9_METRICS = {
     # the in-process isolated control that discriminates band 4's world-2 anomaly (fix 4)
     "alone_us",
     "overlap_ratio",
-    # the causal launch-overhead test (fix 3)
-    "eager_us",
+    # the launch-amortisation sweep and its optional CUDA-graph check (fix 3)
+    "percall_us",
+    "percall_single_us",
+    "percall_batched_us",
+    "amortisation_ratio",
     "graphed_us",
-    "launch_us",
-    "launch_share",
-    "eager_chain_us",
-    "graphed_chain_us",
-    "chain_speedup",
+    "graph_speedup",
     # end-to-end vLLM under real TP (fix 5)
     "step_ms",
     "measured_speedup",

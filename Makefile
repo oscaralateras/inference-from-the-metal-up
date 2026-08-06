@@ -1,5 +1,5 @@
 .PHONY: setup lint format format-check type test ci probe t6 t7 t8 t8-predict t8-ceiling \
-        t9 t9-predict t9-tp t9-rehearse t9-launch t9-vllm
+        t9 t9-predict t9-tp t9-rehearse t9-launch t9-launch-graphs t9-vllm
 
 # GPU topics. Run `make probe` once per pod first — T6, T7 and T8 all read their ceilings from the
 # hardware profile it writes, and a cross-topic test asserts they came from the same session.
@@ -64,6 +64,9 @@ t9:
 	uv run python -m topics.t09_interconnects.plot
 t9-tp: ; uv run python -m topics.t09_interconnects.tp_matmul --backend nccl --world-sizes 1,2,4
 t9-launch: ; uv run python -m topics.t09_interconnects.launch --world-sizes 2,4
+# Add --graphs to also capture/replay. Kept opt-in: NCCL inside graph capture deadlocked a
+# session once already, and the amortisation sweep answers the question without it.
+t9-launch-graphs: ; uv run python -m topics.t09_interconnects.launch --world-sizes 2,4 --graphs
 t9-vllm: ; uv run python -m topics.t09_interconnects.vllm_tp --tp 1,2,4
 
 setup: ; uv sync

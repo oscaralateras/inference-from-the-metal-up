@@ -1,32 +1,39 @@
-"""Is alpha launch overhead? Test it by removing the launches.
+"""Is alpha host launch overhead? Amortise the launches away and see what moves.
 
-    uv run python -m topics.t09_interconnects.launch --backend nccl --world-sizes 2,4
+    uv run python -m topics.t09_interconnects.launch --world-sizes 2,4
+    uv run python -m topics.t09_interconnects.launch --world-sizes 2,4 --graphs
 
-The main result says a decode-sized all-reduce costs ~35 us of which the ring's hops explain 1.5%,
-and attributes the rest to launch and synchronisation. That attribution was an **inference** — it
-rested on alpha being flat across world size plus NCCL reporting a single channel. Neither observes
-launch cost. This module measures it, by the most direct means available:
+The main result says a decode-sized all-reduce costs ~34 us of which the ring's hops explain almost
+none, and attributes the rest to launch and synchronisation. That attribution was an **inference**
+— it rested on alpha being flat across world size plus NCCL reporting a single channel. Neither
+observes launch cost. This module measures it.
 
-**Capture the collective into a CUDA graph and replay it.** A graph replay submits the whole
-recorded sequence with one launch instead of one launch per operation, so whatever part of alpha is
-per-call dispatch cost disappears; whatever part is genuinely on the wire or in the kernel does not.
-The prediction is therefore sharp and falsifiable in both directions:
+**The amortisation sweep, and why it is the primary measurement.** Host-side dispatch is a cost
+paid once per call *on the CPU*, and it overlaps with the GPU executing the previous call. So
+issuing N collectives back to back inside one timed window hides all but the first one's dispatch:
+if alpha is host launch cost, per-call time must fall as N rises, and flatten once the queue stays
+ahead of the device. If alpha is device-side — protocol synchronisation, flag exchange, the LL
+protocol's own handshake — then batching the launches changes nothing at all, because each call
+still has to happen on the GPU in sequence.
 
-* if alpha is launch-bound, graph replay collapses it
-* if alpha is ring latency or protocol synchronisation, graph replay changes almost nothing
+This reframed the topic's own headline mid-flight, and the reason is worth recording. `measure.py`
+already times with 16 back-to-back calls per window, so the alpha it reports is **already** an
+amortised-launch number. Host dispatch had therefore already been ruled out before this module was
+written, and the lab note's phrase "launch and synchronisation" was carrying an implication about
+the launch half that the measurement did not support. This sweep tests it directly instead of
+inferring, and it can falsify the claim in either direction.
 
-This is a **causal** test rather than a profiler reading, which is why it is preferred here: it
-intervenes on the suspected mechanism instead of inspecting a timeline and inferring from it. It is
-also the same instrument T6 used to find CUDA graphs worth 15-36% of a decode step, and the one T11
-is built around — so a result here is directly comparable with both.
-
-The chain is timed as well as the single call. A decode step fires 56 collectives back to back, and
-capturing the whole chain into one graph is what a serving engine actually does; measuring only a
-single captured call would understate what the technique buys.
+**CUDA graph replay is the secondary check.** Capturing the collective and replaying it removes the
+per-call dispatch entirely rather than merely overlapping it, which is a stronger intervention than
+the sweep. It is second rather than first because it deadlocks easily: `torch.cuda.graph` defaults
+to `capture_error_mode="global"`, which treats CUDA work from any other thread as illegal, and
+NCCL's watchdog thread does exactly that. The first attempt hung two ranks for eleven minutes at
+0% GPU utilisation before it was killed. `thread_local` is the fix, and the whole stage is guarded
+so a repeat cannot cost another session.
 
 Deliberately **not** an Nsight capture. `nsys` is not present in every pod image, and a timeline
-would still need interpreting — "this region is launch" is a judgement call, whereas "removing the
-launches removed 30 us" is a measurement.
+would still need interpreting — "this region is launch" is a judgement call, whereas "batching the
+launches changed nothing" is a measurement.
 """
 
 from __future__ import annotations
@@ -56,19 +63,27 @@ from topics.t09_interconnects.model import (
 # question does not arise because the call is dominated by bytes.
 DEFAULT_BATCHES = (1, 8, 32)
 
+# How many collectives share one timed window. At 1 the host pays dispatch for every call with
+# nothing to hide it behind; by 64 the queue is far enough ahead of the device that dispatch is
+# entirely overlapped. The shape of per-call time across this sweep is the measurement.
+INNER_SWEEP = (1, 2, 4, 8, 16, 32, 64)
+
 # Collectives per token under tensor parallelism — the chain a serving engine captures as one graph.
 CHAIN_LENGTH = DEFAULT_LAYERS * ALLREDUCES_PER_LAYER
-
-CALLS_PER_TIMING = 16
 
 
 def _capture(fn, device: torch.device) -> torch.cuda.CUDAGraph:
     """Record `fn` into a CUDA graph on a side stream, then return the replayable graph.
 
-    NCCL collectives are capturable, but only from a non-default stream and only after the
-    communicator has been warmed up — a first call inside capture tries to build the communicator,
-    which allocates and synchronises, and capture rejects both. The warmup below is therefore load
-    bearing rather than hygiene.
+    Two things here are load bearing rather than hygiene, and the first attempt at this module
+    deadlocked two ranks for eleven minutes by getting the second one wrong:
+
+    * **The warmup.** A first collective inside capture tries to build the communicator, which
+      allocates and synchronises, and capture rejects both.
+    * **`capture_error_mode="thread_local"`.** The default is `"global"`, which treats CUDA work
+      issued from *any* thread during capture as an error. NCCL runs a watchdog thread that does
+      exactly that, so capture and watchdog block on each other and neither times out. Scoping the
+      check to the capturing thread is what makes NCCL capturable at all.
     """
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream(device))
@@ -79,7 +94,7 @@ def _capture(fn, device: torch.device) -> torch.cuda.CUDAGraph:
     torch.cuda.synchronize(device)
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, capture_error_mode="thread_local"):
         fn()
     return graph
 
@@ -99,48 +114,40 @@ def _worker(rank: int, world: int, cfg: dict, out_path: str) -> None:
         def one(buf=buf) -> None:
             dist.all_reduce(buf)
 
-        def chain(buf=buf) -> None:
-            for _ in range(CHAIN_LENGTH):
-                dist.all_reduce(buf)
+        # The amortisation sweep. `time_op` divides by `inner`, so every entry is a per-call cost
+        # and they are directly comparable: a falling curve is dispatch being hidden, a flat one is
+        # a cost the device pays whatever the host does.
+        per_call: dict[str, float] = {}
+        for inner in cfg["inner_sweep"]:
+            dist.barrier()
+            us = time_op(one, device, inner=inner) * 1e3
+            reduced = torch.tensor([us], device=device, dtype=torch.float64)
+            dist.all_reduce(reduced, op=dist.ReduceOp.MAX)
+            per_call[str(inner)] = float(reduced.item())
 
-        dist.barrier()
-        eager_us = time_op(one, device, inner=CALLS_PER_TIMING) * 1e3
-
-        dist.barrier()
-        graph_one = _capture(one, device)
-        # Bound as a default argument rather than captured, like every other closure here: a bare
-        # `lambda: graph_one.replay()` closes over the loop variable, so it would replay whichever
-        # graph the loop happened to be holding when it ran rather than this batch's.
-        graphed_us = time_op(lambda g=graph_one: g.replay(), device, inner=CALLS_PER_TIMING) * 1e3
-
-        dist.barrier()
-        eager_chain_us = time_op(chain, device, inner=1) * 1e3
-
-        dist.barrier()
-        graph_chain = _capture(chain, device)
-        graphed_chain_us = time_op(lambda g=graph_chain: g.replay(), device, inner=1) * 1e3
-
-        stats = torch.tensor(
-            [eager_us, graphed_us, eager_chain_us, graphed_chain_us],
-            device=device,
-            dtype=torch.float64,
-        )
-        dist.all_reduce(stats, op=dist.ReduceOp.MAX)
-        eager_us, graphed_us, eager_chain_us, graphed_chain_us = (float(v) for v in stats)
-
-        out[str(batch)] = {
-            "eager_us": eager_us,
-            "graphed_us": graphed_us,
-            "launch_us": max(0.0, eager_us - graphed_us),
-            "launch_share": max(0.0, eager_us - graphed_us) / eager_us if eager_us else 0.0,
-            "eager_chain_us": eager_chain_us,
-            "graphed_chain_us": graphed_chain_us,
-            "chain_speedup": eager_chain_us / graphed_chain_us if graphed_chain_us else 0.0,
+        lo, hi = per_call[str(cfg["inner_sweep"][0])], per_call[str(cfg["inner_sweep"][-1])]
+        stats = {
+            "percall_single_us": lo,
+            "percall_batched_us": hi,
+            # > 1 means batching the launches made each call cheaper, i.e. there was host dispatch
+            # to hide. ~1 means alpha is device-side and "launch overhead" is the wrong label.
+            "amortisation_ratio": lo / hi if hi else 0.0,
         }
 
-        # Not `del`ed: the graphs are rebound next iteration and freed then. Deleting them here
-        # would leave the names unbound, which is what the default-arg binding above exists to
-        # avoid depending on.
+        if cfg["graphs"]:
+            dist.barrier()
+            graph_one = _capture(one, device)
+            graphed = (
+                time_op(lambda g=graph_one: g.replay(), device, inner=cfg["inner_sweep"][-1]) * 1e3
+            )
+            reduced = torch.tensor([graphed], device=device, dtype=torch.float64)
+            dist.all_reduce(reduced, op=dist.ReduceOp.MAX)
+            graphed = float(reduced.item())
+            stats["graphed_us"] = graphed
+            stats["graph_speedup"] = hi / graphed if graphed else 0.0
+
+        out[str(batch)] = {"per_call": per_call, **stats}  # type: ignore[dict-item]
+
         del buf
         torch.cuda.empty_cache()
 
@@ -165,31 +172,52 @@ def _main() -> None:
     parser.add_argument("--port", type=int, default=29523)
     parser.add_argument("--hidden", type=int, default=DEFAULT_HIDDEN)
     parser.add_argument(
-        "--backend", choices=("nccl",), default="nccl", help="CUDA graphs need CUDA"
+        "--graphs",
+        action="store_true",
+        help="also capture and replay the collective. Off by default: NCCL inside CUDA graph "
+        "capture deadlocks if anything is slightly wrong, and the sweep alone answers the question",
     )
     args = parser.parse_args()
 
     session = load_profile().session_id
     rows: list[dict[str, object]] = []
 
-    print("T9 — is alpha launch overhead? Capture the collective and see what survives.\n")
-    print(f"chain length {CHAIN_LENGTH} collectives (= one token under TP)\n")
+    print("T9 — is alpha host launch overhead? Amortise the launches and see what moves.\n")
+    print(f"per-call microseconds, by how many calls share one timed window {INNER_SWEEP}\n")
 
     for world in [int(w) for w in args.world_sizes.split(",")]:
         result = run_world(
             world,
-            {"port": args.port, "hidden": args.hidden, "batches": list(DEFAULT_BATCHES)},
+            {
+                "port": args.port,
+                "hidden": args.hidden,
+                "batches": list(DEFAULT_BATCHES),
+                "inner_sweep": list(INNER_SWEEP),
+                "graphs": args.graphs,
+            },
         )
         print(f"world {world}:")
         for batch, s in sorted(result["batches"].items(), key=lambda kv: int(kv[0])):
-            print(
-                f"  batch {int(batch):>3}: eager {s['eager_us']:>7.2f} us  "
-                f"graphed {s['graphed_us']:>7.2f} us  "
-                f"launch {s['launch_us']:>7.2f} us ({s['launch_share']:>5.1%})   "
-                f"| chain {s['eager_chain_us']:>8.1f} -> {s['graphed_chain_us']:>8.1f} us "
-                f"({s['chain_speedup']:.2f}x)"
-            )
+            curve = "  ".join(f"{int(i):>2}:{s['per_call'][str(i)]:>6.2f}" for i in INNER_SWEEP)
+            line = f"  batch {int(batch):>3}: {curve}   ratio {s['amortisation_ratio']:.2f}x"
+            if "graph_speedup" in s:
+                line += f"   graphed {s['graphed_us']:.2f} us ({s['graph_speedup']:.2f}x)"
+            print(line)
+
+            for inner in INNER_SWEEP:
+                rows.append(
+                    {
+                        "session_id": session,
+                        "experiment": "launch_amortisation",
+                        "variant": f"world{world}_b{int(batch)}",
+                        "x": int(inner),
+                        "metric": "percall_us",
+                        "value": s["per_call"][str(inner)],
+                    }
+                )
             for metric, value in s.items():
+                if metric == "per_call":
+                    continue
                 rows.append(
                     {
                         "session_id": session,
