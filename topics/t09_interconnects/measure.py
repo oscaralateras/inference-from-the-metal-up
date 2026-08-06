@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import statistics
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,7 @@ from topics.t09_interconnects.model import (
     allreduce_bytes,
     bus_gbps,
     comms_per_token_us,
+    fit_latency_budget,
     fit_ring_cost,
     predicted_tp_speedup,
     sweep_sizes,
@@ -82,13 +84,25 @@ CALLS_PER_TIMING = 16
 REDUCE_ACROSS_RANKS = "max"
 
 
+# Whole-sweep repeats. `time_op` already medians across its own iterations, so this is not about
+# within-run jitter -- it is about whether the headline claim survives being measured again. That
+# claim is "alpha is the same at 2 and 4 GPUs", and a difference of 0.35 us out of 35 is only
+# meaningful against a known spread. T8 learned this the same way and reports 659-662 GB/s.
+DEFAULT_REPEATS = 3
+
+
 @dataclass(frozen=True)
 class SweepResult:
-    """One world size's worth of measurements, gathered on rank 0."""
+    """One world size's worth of measurements, gathered on rank 0.
+
+    `times_us` is the per-size median across repeats; `repeats_us` keeps every repeat so the fit
+    can be run independently on each and the spread in alpha reported rather than asserted.
+    """
 
     world: int
     sizes: list[int]
     times_us: list[float]
+    repeats_us: list[list[float]]
     smoke_bus_gbps: float
     nvlink_width: int
     device_name: str
@@ -138,18 +152,24 @@ def _worker(rank: int, world: int, cfg: dict, out_path: str) -> None:
         torch.cuda.empty_cache()
 
     sizes: list[int] = []
-    times: list[float] = []
-    for nbytes in cfg["sizes"]:
-        numel = max(1, nbytes // element)
-        buf = torch.ones(numel, dtype=dtype, device=device)
-        # Large messages take milliseconds, so batching launches inside them wastes wall clock on
-        # a metered box and buys nothing — the launch cost is already negligible against them.
-        inner = CALLS_PER_TIMING if nbytes <= 1024 * 1024 else 1
-        times.append(_time_allreduce(buf, device, inner=inner))
-        sizes.append(numel * element)
-        del buf
-        if backend == "nccl":
-            torch.cuda.empty_cache()
+    repeats: list[list[float]] = []
+    for repeat in range(cfg["repeats"]):
+        pass_times: list[float] = []
+        for nbytes in cfg["sizes"]:
+            numel = max(1, nbytes // element)
+            buf = torch.ones(numel, dtype=dtype, device=device)
+            # Large messages take milliseconds, so batching launches inside them wastes wall clock
+            # on a metered box and buys nothing — launch cost is already negligible against them.
+            inner = CALLS_PER_TIMING if nbytes <= 1024 * 1024 else 1
+            pass_times.append(_time_allreduce(buf, device, inner=inner))
+            if repeat == 0:
+                sizes.append(numel * element)
+            del buf
+            if backend == "nccl":
+                torch.cuda.empty_cache()
+        repeats.append(pass_times)
+
+    medians = [statistics.median(pass_[i] for pass_ in repeats) for i in range(len(sizes))]
 
     if rank == 0:
         topo = read_topo() if backend == "nccl" else None
@@ -158,7 +178,8 @@ def _worker(rank: int, world: int, cfg: dict, out_path: str) -> None:
                 {
                     "world": world,
                     "sizes": sizes,
-                    "times_us": times,
+                    "times_us": medians,
+                    "repeats_us": repeats,
                     "smoke_bus_gbps": smoke_bus,
                     "nvlink_width": topo.nvlink_width(world) if topo else 0,
                     "device_name": (
@@ -181,7 +202,9 @@ def run_world(world: int, cfg: dict) -> SweepResult:
     return SweepResult(**json.loads(Path(out_path).read_text()))
 
 
-def _rows(session: str, result: SweepResult, fit, prediction) -> list[dict[str, object]]:
+def _rows(
+    session: str, result: SweepResult, fit, prediction, alphas: list[float]
+) -> list[dict[str, object]]:
     """Long-format rows: the sweep, the fit, and the decode operating points."""
     world = result.world
     rows: list[dict[str, object]] = []
@@ -214,6 +237,9 @@ def _rows(session: str, result: SweepResult, fit, prediction) -> list[dict[str, 
         ("beta_gbps", fit.beta_gbps),
         ("fit_r_squared", fit.r_squared),
         ("crossover_bytes", fit.crossover_bytes()),
+        ("alpha_us_min", alphas[0]),
+        ("alpha_us_max", alphas[-1]),
+        ("repeats", float(len(alphas))),
     ):
         rows.append(
             {
@@ -253,8 +279,14 @@ def _rows(session: str, result: SweepResult, fit, prediction) -> list[dict[str, 
 def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("gloo", "nccl"), default="gloo")
-    parser.add_argument("--world-sizes", default="2,4")
+    parser.add_argument("--world-sizes", default="2,3,4")
     parser.add_argument("--port", type=int, default=29509)
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=DEFAULT_REPEATS,
+        help="whole-sweep repeats; the fit runs on each so alpha gets a spread, not a point",
+    )
     parser.add_argument("--max-bytes", type=int, default=1024**3)
     parser.add_argument(
         "--skip-gate",
@@ -284,7 +316,15 @@ def _main() -> None:
                 f"topology gate (declared) PASSED for world={world}: NV{topo.nvlink_width(world)}"
             )
 
-        result = run_world(world, {"backend": args.backend, "port": args.port, "sizes": sizes})
+        result = run_world(
+            world,
+            {
+                "backend": args.backend,
+                "port": args.port,
+                "sizes": sizes,
+                "repeats": args.repeats,
+            },
+        )
 
         if args.backend == "nccl" and not args.skip_gate:
             check_empirical(result.smoke_bus_gbps, world)
@@ -295,12 +335,20 @@ def _main() -> None:
             )
 
         fit = fit_ring_cost(world, list(zip(result.sizes, result.times_us, strict=True)))
-        fits[world] = (fit, result)
+        # One fit per repeat, so the spread in alpha is measured rather than assumed. The topic's
+        # headline is that alpha does not change with world size; a difference of 0.35 us out of 35
+        # only means something set against how much alpha moves when nothing changes at all.
+        per_repeat = [
+            fit_ring_cost(world, list(zip(result.sizes, pass_, strict=True)))
+            for pass_ in result.repeats_us
+        ]
+        alphas = sorted(f.alpha_us for f in per_repeat)
+        fits[world] = (fit, result, alphas)
 
         print(
             f"\nworld {world}: alpha {fit.alpha_us:.2f} us "
-            f"({fit.alpha_step_us:.2f} us/hop), beta {fit.beta_gbps:,.1f} GB/s, "
-            f"R^2 {fit.r_squared:.4f}"
+            f"(spread {alphas[0]:.2f}-{alphas[-1]:.2f} over {len(alphas)} repeats), "
+            f"beta {fit.beta_gbps:,.1f} GB/s, R^2 {fit.r_squared:.4f}"
         )
         print(f"  crossover at {fit.crossover_bytes() / 1024:,.0f} KB")
         for batch in (1, 8, 32, 128):
@@ -313,7 +361,10 @@ def _main() -> None:
                 f"-> {speedup:.2f}x"
             )
 
-        append_rows(CSV_PATH, _rows(session, result, fit, (weight_share, tokens_per_sec, step_ms)))
+        append_rows(
+            CSV_PATH,
+            _rows(session, result, fit, (weight_share, tokens_per_sec, step_ms), alphas),
+        )
 
     _score_bands(fits, prediction)
 
@@ -335,7 +386,28 @@ def _score_bands(fits: dict, prediction) -> None:
     else:
         print("(1) alpha scaling: SKIPPED (needs both world 2 and world 4)")
 
-    for world, (fit, result) in sorted(fits.items()):
+    # Separate the size-independent floor from the per-hop cost. At three or more world sizes this
+    # carries a residual, so "the hops explain almost none of alpha" becomes a claim the data could
+    # have refuted rather than an identity.
+    budget = fit_latency_budget({w: f.alpha_us for w, (f, _, _) in fits.items()})
+    tested = "fitted, R^2" if budget.n_worlds > 2 else "exactly determined, R^2 meaningless at"
+    print(
+        f"\n    alpha(N) = {budget.floor_us:.2f} us + 2(N-1) x {budget.hop_us:.3f} us "
+        f"({tested} {budget.r_squared:.4f}, {budget.n_worlds} world sizes)"
+    )
+    for world in sorted(fits):
+        print(
+            f"      world {world}: measured {fits[world][0].alpha_us:>8.2f} us  "
+            f"model {budget.alpha_us(world):>8.2f} us  hops {budget.hop_share(world):>6.2%} of it"
+        )
+    if budget.floor_us < 0:
+        print(
+            "      NOTE: the fitted floor is negative, which is not a physical quantity. It means "
+            "alpha\n            rises faster than linearly in hop count, so this decomposition "
+            "does not describe\n            the data and its split must not be quoted."
+        )
+
+    for world, (fit, result, _) in sorted(fits.items()):
         if result.nvlink_width:
             spec = result.nvlink_width * NVLINK_GBPS_PER_LINK
             share = fit.beta_gbps / spec

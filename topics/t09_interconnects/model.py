@@ -269,6 +269,58 @@ def fit_ring_cost(
     )
 
 
+@dataclass(frozen=True)
+class LatencyBudget:
+    """`alpha(N) = floor + 2(N-1)*hop`, fitted across world sizes.
+
+    The point of fitting this rather than solving it: with only two world sizes there are as many
+    equations as unknowns, so the decomposition reproduces the data exactly and cannot be wrong. A
+    third world size gives the model a residual and therefore the ability to fail — which matters,
+    because the claim being made is that the ring's hop count explains almost none of the fixed
+    cost, and a decomposition that cannot fail is not evidence for anything.
+    """
+
+    floor_us: float
+    hop_us: float
+    r_squared: float
+    n_worlds: int
+
+    def alpha_us(self, world: int) -> float:
+        return self.floor_us + ring_hops(world) * self.hop_us
+
+    def hop_share(self, world: int) -> float:
+        """Fraction of `alpha(N)` attributable to ring traversal."""
+        alpha = self.alpha_us(world)
+        return ring_hops(world) * self.hop_us / alpha if alpha else 0.0
+
+
+def fit_latency_budget(alphas: dict[int, float]) -> LatencyBudget:
+    """Least squares of `alpha` on hop count across world sizes.
+
+    Exactly determined at two world sizes (R^2 is then 1.0 by construction and means nothing);
+    genuinely tested at three or more.
+    """
+    if len(alphas) < 2:
+        raise ValueError(f"need >= 2 world sizes to separate floor from hop, got {len(alphas)}")
+
+    xs = [float(ring_hops(w)) for w in sorted(alphas)]
+    ys = [alphas[w] for w in sorted(alphas)]
+    n = len(xs)
+    mean_x, mean_y = sum(xs) / n, sum(ys) / n
+
+    sxx = sum((x - mean_x) ** 2 for x in xs)
+    if sxx == 0:
+        raise ValueError("every world size has the same hop count — the split is undefined")
+    hop = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=True)) / sxx
+    floor = mean_y - hop * mean_x
+
+    ss_tot = sum((y - mean_y) ** 2 for y in ys)
+    ss_res = sum((y - (floor + hop * x)) ** 2 for x, y in zip(xs, ys, strict=True))
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+
+    return LatencyBudget(floor_us=floor, hop_us=hop, r_squared=r_squared, n_worlds=n)
+
+
 def sweep_sizes(
     min_bytes: int = SWEEP_MIN_BYTES,
     max_bytes: int = SWEEP_MAX_BYTES,

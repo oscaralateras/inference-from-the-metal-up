@@ -248,6 +248,25 @@ T9_METRICS = {
     "comms_us",
     "comms_share",
     "measured_over_predicted",
+    # repeat spread (fix 2)
+    "alpha_us_min",
+    "alpha_us_max",
+    "repeats",
+    # the in-process isolated control that discriminates band 4's world-2 anomaly (fix 4)
+    "alone_us",
+    "overlap_ratio",
+    # the causal launch-overhead test (fix 3)
+    "eager_us",
+    "graphed_us",
+    "launch_us",
+    "launch_share",
+    "eager_chain_us",
+    "graphed_chain_us",
+    "chain_speedup",
+    # end-to-end vLLM under real TP (fix 5)
+    "step_ms",
+    "measured_speedup",
+    "modelled_speedup",
 }
 
 
@@ -281,4 +300,4 @@ def test_t9_reports_only_interconnect_metrics() -> None:
     if not T9_CSV.exists():
         pytest.skip("T9 has not been run in this session")
     seen = {r["metric"] for r in read_rows(T9_CSV)}
-    assert seen <= (T9_METRICS | {"tp_speedup"})
+    assert seen <= (T9_METRICS | {"tp_speedup", "tokens_per_sec"})

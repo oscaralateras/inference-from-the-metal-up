@@ -18,6 +18,7 @@ from topics.t09_interconnects.model import (
     bus_factor,
     bus_gbps,
     comms_per_token_us,
+    fit_latency_budget,
     fit_ring_cost,
     predicted_tp_speedup,
     prefill_allreduce_bytes,
@@ -501,3 +502,53 @@ def test_lab_note_band_verdicts_are_reported_correctly() -> None:
         assert ratios, f"no tp_model_check rows for world {world}"
         within = all(1 / 1.5 <= r <= 1.5 for r in ratios)
         assert within is expected_pass
+
+
+# ---------------------------------------------------------------------------------------------
+# separating the fixed floor from the ring's hops
+# ---------------------------------------------------------------------------------------------
+
+
+def test_latency_budget_recovers_a_known_floor_and_hop() -> None:
+    """Build alphas from a known (floor, hop) and check both come back."""
+    floor, hop = 33.0, 0.5
+    alphas = {w: floor + ring_hops(w) * hop for w in (2, 3, 4)}
+
+    budget = fit_latency_budget(alphas)
+
+    assert budget.floor_us == pytest.approx(floor, rel=1e-6)
+    assert budget.hop_us == pytest.approx(hop, rel=1e-6)
+    assert budget.r_squared == pytest.approx(1.0)
+    assert budget.n_worlds == 3
+
+
+def test_two_world_sizes_cannot_falsify_the_decomposition() -> None:
+    """The reason world 3 was added: at two points the fit is exact whatever the data says."""
+    budget = fit_latency_budget({2: 35.45, 4: 35.80})
+
+    assert budget.n_worlds == 2
+    assert budget.r_squared == pytest.approx(1.0)
+    assert budget.alpha_us(2) == pytest.approx(35.45)
+    assert budget.alpha_us(4) == pytest.approx(35.80)
+
+
+def test_three_world_sizes_can_fail_to_fit() -> None:
+    """With a residual available, a curve that is not linear in hops shows up as one."""
+    budget = fit_latency_budget({2: 35.0, 3: 80.0, 4: 36.0})
+
+    assert budget.n_worlds == 3
+    assert budget.r_squared < 0.5
+
+
+def test_a_flat_alpha_puts_almost_nothing_on_the_hops() -> None:
+    """T9's headline, as a property of the estimator rather than of one dataset."""
+    budget = fit_latency_budget({2: 35.45, 3: 35.60, 4: 35.80})
+
+    assert budget.hop_us < 0.2
+    assert budget.hop_share(4) < 0.05
+    assert budget.floor_us == pytest.approx(35.2, abs=0.3)
+
+
+def test_latency_budget_needs_at_least_two_world_sizes() -> None:
+    with pytest.raises(ValueError, match=">= 2 world sizes"):
+        fit_latency_budget({4: 35.8})

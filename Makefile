@@ -1,5 +1,5 @@
 .PHONY: setup lint format format-check type test ci probe t6 t7 t8 t8-predict t8-ceiling \
-        t9 t9-predict t9-tp t9-rehearse
+        t9 t9-predict t9-tp t9-rehearse t9-launch t9-vllm
 
 # GPU topics. Run `make probe` once per pod first — T6, T7 and T8 all read their ceilings from the
 # hardware profile it writes, and a cross-topic test asserts they came from the same session.
@@ -51,10 +51,20 @@ t9-rehearse:
 	    --max-bytes 16777216
 	uv run python -m topics.t09_interconnects.tp_matmul --backend gloo --world-sizes 1,2,4 \
 	    --hidden 512 --intermediate 2048
+#   5. t9-launch   the causal test for what alpha actually is: capture the collective into a CUDA
+#                   graph and see how much of the 35 us survives losing its launches.
+#   6. t9-vllm      the end-to-end number, measured rather than modelled. Slowest of the lot --
+#                   three engines, one per TP size, each loading a 7B.
+#
+# World 3 is in the sweep deliberately: with only 2 and 4, the alpha = L + 2(N-1)h decomposition
+# has exactly as many equations as unknowns and cannot fail. It is skipped in tp_matmul, where
+# 18944 does not divide by 3.
 t9:
-	uv run python -m topics.t09_interconnects.measure --backend nccl --world-sizes 2,4
+	uv run python -m topics.t09_interconnects.measure --backend nccl --world-sizes 2,3,4
 	uv run python -m topics.t09_interconnects.plot
 t9-tp: ; uv run python -m topics.t09_interconnects.tp_matmul --backend nccl --world-sizes 1,2,4
+t9-launch: ; uv run python -m topics.t09_interconnects.launch --world-sizes 2,4
+t9-vllm: ; uv run python -m topics.t09_interconnects.vllm_tp --tp 1,2,4
 
 setup: ; uv sync
 lint: ; uv run ruff check .

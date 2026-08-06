@@ -17,7 +17,14 @@
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/oscaralateras/inference-from-the-metal-up}"
-WORKDIR="${WORKDIR:-/workspace/inference-from-the-metal-up}"
+
+# Local container disk, NOT /workspace. RunPod mounts /workspace as a network volume (MooseFS)
+# which manages roughly 250 small-file creates per second; unpacking torch and vLLM writes well
+# over 100,000 files, so `uv sync` grinds there for tens of minutes while the network itself sits
+# idle at ~200 MB/s. That cost real rented time before it was diagnosed. Nothing here needs to
+# survive the pod -- results are committed and pushed -- so persistence buys nothing.
+WORKDIR="${WORKDIR:-/root/ifmu}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/root/.cache/uv}"
 WORLD="${WORLD:-4}"
 
 say() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }

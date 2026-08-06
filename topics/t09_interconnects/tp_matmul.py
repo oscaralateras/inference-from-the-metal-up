@@ -93,6 +93,9 @@ def _worker(rank: int, world: int, cfg: dict, out_path: str) -> None:
             if world > 1:
                 dist.all_reduce(partial)
 
+        def alone(partial=partial) -> None:
+            dist.all_reduce(partial)
+
         if world > 1:
             dist.barrier()
         matmul_ms = time_op(matmul, device, inner=CALLS_PER_TIMING)
@@ -100,9 +103,27 @@ def _worker(rank: int, world: int, cfg: dict, out_path: str) -> None:
             dist.barrier()
         full_ms = time_op(full, device, inner=CALLS_PER_TIMING)
 
+        # The in-process isolated control, and the reason it exists.
+        #
+        # Band 4 failed at world 2 in the first session: the collective inside this layer came out
+        # roughly twice as fast as the same collective in `measure.py`'s sweep, while world 4 agreed
+        # within a few percent. Two explanations fitted equally well and the run could not separate
+        # them -- either the all-reduce partly overlaps the matmul here (so the difference method
+        # under-attributes it), or the sweep's isolated measurement is simply not comparable across
+        # processes, buffers and communicators.
+        #
+        # Timing the same buffer alone, in this process, immediately alongside the layer removes the
+        # second explanation entirely. If `alone_us` matches the sweep's prediction, the cross-
+        # process comparison was sound and the gap is overlap. If `alone_us` matches the in-situ
+        # `comms_us` instead, the sweep was measuring something this process does not reproduce and
+        # the band was scored against the wrong baseline.
+        alone_us = 0.0
+        if world > 1:
+            dist.barrier()
+            alone_us = time_op(alone, device, inner=CALLS_PER_TIMING) * 1e3
+
         # The collective's cost as the layer actually experiences it: what the step costs with it
-        # minus what the same step costs without it. Timing the all-reduce alone would measure it
-        # in isolation again, which is precisely the thing this stage exists to stop doing.
+        # minus what the same step costs without it.
         #
         # Pinned to exactly zero at world 1, where the two timed closures are the same code and
         # their difference is nothing but timing noise. Reporting that noise as a communication
@@ -110,15 +131,22 @@ def _worker(rank: int, world: int, cfg: dict, out_path: str) -> None:
         comms_us = max(0.0, (full_ms - matmul_ms) * 1e3) if world > 1 else 0.0
 
         if world > 1:
-            stats = torch.tensor([matmul_ms, full_ms, comms_us], device=device, dtype=torch.float64)
+            stats = torch.tensor(
+                [matmul_ms, full_ms, comms_us, alone_us], device=device, dtype=torch.float64
+            )
             dist.all_reduce(stats, op=dist.ReduceOp.MAX)
-            matmul_ms, full_ms, comms_us = (float(v) for v in stats)
+            matmul_ms, full_ms, comms_us, alone_us = (float(v) for v in stats)
 
         out[str(batch)] = {
             "matmul_us": matmul_ms * 1e3,
             "full_us": full_ms * 1e3,
             "comms_us": comms_us,
             "comms_share": comms_us / (full_ms * 1e3) if full_ms > 0 else 0.0,
+            "alone_us": alone_us,
+            # > 1 means the collective is cheaper inside the layer than beside it, which is the
+            # signature of overlap; ~1 means the in-situ measurement was never anomalous and the
+            # sweep's cross-process baseline was the problem.
+            "overlap_ratio": alone_us / comms_us if comms_us > 0 else 0.0,
         }
         del x, partial
 
@@ -192,9 +220,17 @@ def _main() -> None:
             print(
                 f"  batch {int(batch):>3}: matmul {stats['matmul_us']:>8.1f} us  "
                 f"step {stats['full_us']:>8.1f} us  comms {stats['comms_us']:>7.1f} us "
-                f"({stats['comms_share']:>5.1%})  speedup {speedup:.2f}x"
+                f"({stats['comms_share']:>5.1%})  alone {stats['alone_us']:>7.1f} us "
+                f"(x{stats['overlap_ratio']:.2f})  speedup {speedup:.2f}x"
             )
-            for metric in ("matmul_us", "full_us", "comms_us", "comms_share"):
+            for metric in (
+                "matmul_us",
+                "full_us",
+                "comms_us",
+                "comms_share",
+                "alone_us",
+                "overlap_ratio",
+            ):
                 rows.append(
                     {
                         "session_id": session,
