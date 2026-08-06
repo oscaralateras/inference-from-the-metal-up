@@ -13,6 +13,7 @@ are meaningful on a laptop where the timings would be noise.
 from __future__ import annotations
 
 import mmap
+import os
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,9 @@ from topics.t10_os_virtual_memory.h2d import series_gbps
 from topics.t10_os_virtual_memory.loaders import (
     LOADERS,
     counted_faults,
+    drop_page_cache,
+    evict_file,
+    go_cold,
     load_via_mmap,
     load_via_read,
     make_weight_file,
@@ -206,6 +210,46 @@ def test_counted_faults_sees_faults_from_a_fresh_anonymous_mapping() -> None:
     assert 0.05 < faults["minor"] / pages < 2.0, (
         f"{faults['minor']} faults for {pages} fresh pages — the counter is not working"
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# going cold, which is the one thing the measurement cannot fake
+# ---------------------------------------------------------------------------------------------
+
+
+def test_eviction_reports_whether_it_was_possible_rather_than_raising(weight_file: Path) -> None:
+    """Both mechanisms return a bool, so `go_cold` can choose between them without exceptions.
+
+    `posix_fadvise` is Linux-only and the global drop needs a privileged container, so on a Mac
+    both return False and on a rented pod at least one returns True. Neither is an error on its
+    own — only having no mechanism at all is.
+    """
+    assert isinstance(evict_file(weight_file), bool)
+    assert isinstance(drop_page_cache(), bool)
+
+
+@pytest.mark.skipif(not hasattr(os, "posix_fadvise"), reason="posix_fadvise is Linux-only")
+def test_fadvise_is_the_preferred_mechanism_because_it_needs_no_privileges(
+    weight_file: Path,
+) -> None:
+    """On Linux, `go_cold` must not reach for the root-only path when the unprivileged one works.
+
+    This matters in practice rather than in principle: rented containers mount `/proc/sys`
+    read-only, so a harness that insisted on the global drop simply could not measure a cold start
+    on the hardware it was written to run on.
+    """
+    assert go_cold(weight_file) == "posix_fadvise"
+
+
+@pytest.mark.skipif(hasattr(os, "posix_fadvise"), reason="tests the no-mechanism-available path")
+def test_going_cold_refuses_rather_than_pretending_when_no_mechanism_exists() -> None:
+    """The most important line in the module: a cold run that silently ran warm looks like data.
+
+    On macOS neither mechanism exists, so the only correct behaviour is to refuse — and to say so
+    loudly enough that nobody publishes the warm column under a cold heading.
+    """
+    with pytest.raises(RuntimeError, match="cannot evict the page cache"):
+        go_cold(Path(__file__))
 
 
 # ---------------------------------------------------------------------------------------------

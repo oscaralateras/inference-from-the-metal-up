@@ -1,6 +1,6 @@
 """Stages 1 and 2: getting a weight file off a disk and into a process, four different ways.
 
-    uv run python -m topics.t10_os_virtual_memory.loaders --gib 4 --drop-caches
+    uv run python -m topics.t10_os_virtual_memory.loaders --gib 4
 
 The four ways are `read` and `mmap`, each cold and warm, and the interesting axis is not which is
 fastest but **which one is telling the truth about what it did**.
@@ -14,6 +14,14 @@ So every path here is measured twice — once for the load call, once for a pass
 page afterwards — and reported as the sum. `resource.getrusage` supplies the corroboration: a
 copying loader takes almost no faults against its buffer, a lazily mapped one takes one per page,
 and that count is mechanism-level evidence that does not depend on a timer being fair.
+
+**Going cold without root.** The textbook way to evict the page cache is to write to
+`/proc/sys/vm/drop_caches`, which needs root *and* a container privileged enough to have `/proc/sys`
+mounted writable — which rented pods generally are not. `posix_fadvise(POSIX_FADV_DONTNEED)` drops
+one file's cached pages instead, needs no privileges at all, and is the better instrument anyway:
+it evicts the weight file rather than the entire system's cache, so the measurement is not
+perturbed by having just discarded the pages backing Python and torch. `go_cold` prefers it and
+falls back to the global drop.
 """
 
 from __future__ import annotations
@@ -42,32 +50,71 @@ READ_CHUNK_BYTES = 64 * 1024 * 1024
 GENERATOR_SEED = 10
 
 
-def drop_page_cache() -> None:
-    """Evict the page cache, so the next read actually reaches the device.
+def evict_file(path: Path) -> bool:
+    """Evict just this file's pages from the page cache. **No root required.**
 
-    Without this, every load benchmark after the first one measures a memcpy out of DRAM and
-    reports it as disk bandwidth. That is the single most common way a model-load benchmark
-    produces a number that cannot be reproduced on a fresh pod, because a fresh pod is by
-    definition cold and the benchmark never was.
+    `posix_fadvise(POSIX_FADV_DONTNEED)` asks the kernel to drop the cached pages backing one file
+    descriptor. It is the better instrument for this experiment than the global cache drop, not
+    merely the more available one:
 
-    Linux and root only, and it raises rather than warning: a cold measurement that silently ran
-    warm is worse than no measurement, since it looks like data.
+    * **Targeted.** It evicts the weight file and nothing else, so the measurement is not perturbed
+      by having just thrown away the page cache entries for Python, torch, and every shared library
+      the process is about to touch.
+    * **Unprivileged.** Rented containers usually mount `/proc/sys` read-only, so the global drop
+      is unavailable however root you are. This works in an ordinary container.
+
+    Clean pages only — the kernel will not discard dirty ones — hence the `sync` first. Returns
+    whether the call was even possible; `posix_fadvise` is Linux-only, so macOS gets False and the
+    caller falls back or refuses.
     """
-    sync = Path("/proc/sys/vm/drop_caches")
-    if not sync.exists():
-        raise RuntimeError(
-            "cannot drop the page cache — /proc/sys/vm/drop_caches does not exist, so this is "
-            "not Linux. Cold-cache numbers must be measured on the pod; the Mac can only rehearse "
-            "the warm path"
-        )
-    subprocess.run(["sync"], check=True)
+    if not hasattr(os, "posix_fadvise"):
+        return False
+
+    os.sync()
+    with path.open("rb") as f:
+        os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    return True
+
+
+def drop_page_cache() -> bool:
+    """Evict the **entire** page cache. Linux and root, and usually unavailable in a container.
+
+    Kept as the fallback rather than the primary. It is the blunter of the two instruments: it
+    discards every cached page on the system, including ones this process is about to need for
+    reasons unrelated to the measurement.
+    """
+    sysfs = Path("/proc/sys/vm/drop_caches")
+    if not sysfs.exists():
+        return False
     try:
-        sync.write_text("3\n")
-    except PermissionError as exc:
-        raise RuntimeError(
-            "dropping the page cache needs root. Run this on the pod as root, or pass "
-            "--no-cold to measure only the warm path and say so in the note"
-        ) from exc
+        subprocess.run(["sync"], check=True)
+        sysfs.write_text("3\n")
+    except (PermissionError, OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def go_cold(path: Path) -> str:
+    """Make `path` genuinely uncached, by whichever mechanism this box allows.
+
+    Returns the name of the method used, so the lab note can state it rather than implying a cold
+    run happened by unspecified means.
+
+    Raises if neither works. That refusal is deliberate and it is the most important line in this
+    module: a "cold" measurement that silently ran warm is worse than no measurement, because it
+    looks exactly like data. Every published model-load number that does not say how it dropped the
+    cache is suspect for precisely this reason.
+    """
+    if evict_file(path):
+        return "posix_fadvise"
+    if drop_page_cache():
+        return "drop_caches"
+    raise RuntimeError(
+        "cannot evict the page cache by either mechanism — posix_fadvise is unavailable (not "
+        "Linux) and /proc/sys/vm/drop_caches is missing or not writable. Cold numbers cannot be "
+        "measured here. Pass --no-cold to run the warm path only, and the note must then say the "
+        "cold column is absent rather than quoting a warm number as a load time"
+    )
 
 
 def make_weight_file(path: Path, nbytes: int) -> Path:
@@ -227,7 +274,7 @@ def _main() -> None:
             continue
         for loader in LOADERS.values():
             if cache == "cold":
-                drop_page_cache()
+                go_cold(path)
             else:
                 loader(path)  # warm the cache with a discarded run
             print(_report(loader(path), cache))

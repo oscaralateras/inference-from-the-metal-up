@@ -10,16 +10,17 @@
 #
 # Subcommands, in the order they should be run:
 #
-#   gate     one GPU, root, and a writable /proc/sys/vm/drop_caches. ~10 seconds, and it decides
-#            whether the pod is usable before anything is downloaded onto it.
+#   gate     one GPU, a way to evict the page cache, and enough disk. ~10 seconds, and it
+#            decides whether the pod is usable before anything is downloaded onto it.
 #   setup    clone + uv sync + make probe. The slow part (~15 min), mostly downloading torch.
 #   t10      cold start: cold/warm x read/mmap, then H2D pinned vs pageable, then the bands.
 #   t11      fusion vs launch: the 2x2 across the batch sweep, then the crossover.
 #   control  band 3's falsification run — repeats T11's sweep at shorter chain lengths.
 #   all      setup -> t10 -> t11 -> control, with the gate in front.
 #
-# The gate checks for root specifically, because T10's cold-cache measurement is the one thing here
-# that cannot be worked around: without it, every "cold" number is a warm one wearing a disk's name.
+# The gate's real check is page-cache eviction, because that is the one thing T10 cannot fake:
+# without it every "cold" number is a warm one wearing a disk's name. It does NOT require root --
+# posix_fadvise evicts a single file's pages unprivileged, and that is the mechanism T10 prefers.
 set -euo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/oscaralateras/inference-from-the-metal-up}"
@@ -45,11 +46,21 @@ gate() {
   command -v nvidia-smi >/dev/null || die "no nvidia-smi — this is not a GPU node."
   nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 
-  [ "$(id -u)" -eq 0 ] || die "not root. T10's cold-cache reads need /proc/sys/vm/drop_caches, \
-and a cold measurement that silently ran warm is worse than no measurement."
-
-  [ -w /proc/sys/vm/drop_caches ] || die "cannot write /proc/sys/vm/drop_caches — the container \
-is not privileged enough to evict the page cache. T11 would still run; T10 would not."
+  # T10 needs to evict the page cache, and it has two ways to do it. The unprivileged one is the
+  # primary: posix_fadvise(POSIX_FADV_DONTNEED) drops one file's cached pages and needs no root at
+  # all, which matters because rented containers usually mount /proc/sys read-only. The global
+  # drop is the fallback. Only having neither is fatal, and this reports which one you have rather
+  # than insisting on the one you probably do not.
+  if [ -w /proc/sys/vm/drop_caches ]; then
+    say "page-cache eviction: BOTH available (posix_fadvise + global drop_caches)"
+  elif python3 -c 'import os; raise SystemExit(0 if hasattr(os, "posix_fadvise") else 1)'; then
+    say "page-cache eviction: posix_fadvise only (unprivileged, per-file) — this is fine, and is
+what T10 prefers anyway. The global drop is unavailable, which is normal in a container."
+  else
+    die "no way to evict the page cache — neither posix_fadvise nor a writable \
+/proc/sys/vm/drop_caches. T11 would still run; T10's cold column could not be measured, and a \
+cold run that silently ran warm is worse than no run."
+  fi
 
   # Free space for the synthetic weight file, plus headroom for the venv and torch.
   local avail
@@ -57,7 +68,7 @@ is not privileged enough to evict the page cache. T11 would still run; T10 would
   [ "$avail" -ge $((GIB + 30)) ] || die "only ${avail}G free at $(dirname "$WEIGHT_FILE"); \
 need ~$((GIB + 30))G for a ${GIB}G weight file plus torch."
 
-  say "gate PASSED — 1 GPU, root, cache drops available, ${avail}G free"
+  say "gate PASSED — 1 GPU, page-cache eviction available, ${avail}G free"
 }
 
 setup() {

@@ -91,11 +91,19 @@ scaling into is worth 200, keeping the pod warm is cheaper.
 
 ## Method notes
 
-**The cold measurement needs root, and the gate refuses without it.** `/proc/sys/vm/drop_caches`
-is the only way to make a cold run cold. Without it every load benchmark after the first measures a
-memcpy out of DRAM and reports it as disk bandwidth — the single most common reason a published
-model-load number does not reproduce on a fresh pod, because a fresh pod is by definition cold and
-the benchmark never was.
+**Going cold does not need root, and the mechanism is reported rather than implied.** The textbook
+way to evict the page cache is writing to `/proc/sys/vm/drop_caches` — which needs root *and* a
+container privileged enough to have `/proc/sys` mounted writable, which rented pods generally are
+not. `posix_fadvise(POSIX_FADV_DONTNEED)` drops one file's cached pages instead, needs no
+privileges, and is the **better instrument** here: it evicts the weight file rather than the whole
+system's cache, so the measurement is not perturbed by having just discarded the pages backing
+Python and torch. `go_cold()` prefers it, falls back to the global drop, and **refuses if neither
+works** — because a cold run that silently ran warm looks exactly like data.
+
+**And the eviction is verified, not assumed.** A major fault is a page fetched from the device, so
+if the cold `mmap` run takes zero of them the pages were still resident and the "cold" label is a
+lie. The run says so in the output. Without this check, an eviction that quietly no-oped would
+produce a beautifully consistent set of numbers describing nothing.
 
 **The weight file is incompressible on purpose.** A file of zeros can be stored as a hole by the
 filesystem and then "read" at memory speed, which would make stage 1 look like DRAM and the whole
@@ -127,11 +135,11 @@ make t10-rehearse    # the same harness, warm only, small file; numbers not publ
 uv run pytest topics/t10_os_virtual_memory tests
 ```
 
-On a single-GPU Linux pod, **as root** — see [`scripts/t10_t11_session.sh`](../../scripts/t10_t11_session.sh),
+On a single-GPU Linux pod — see [`scripts/t10_t11_session.sh`](../../scripts/t10_t11_session.sh),
 which shares one pod and one hardware probe with T11:
 
 ```bash
-bash s.sh gate      # 1 GPU, root, writable drop_caches, enough disk. ~10s.
+bash s.sh gate      # 1 GPU, a way to evict the page cache, enough disk. ~10s.
 bash s.sh setup     # clone + uv sync + make probe
 bash s.sh t10       # cold/warm x read/mmap, then H2D, then the bands
 ```

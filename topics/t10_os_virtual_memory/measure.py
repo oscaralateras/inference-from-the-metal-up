@@ -55,21 +55,26 @@ def verdict(ok: bool) -> str:
     return "WITHIN" if ok else "OUTSIDE"
 
 
-def run_loaders(path: Path, *, cold: bool) -> dict[tuple[str, str], LoadPath]:
-    """Every (loader, cache-state) combination, each measured from a known cache state."""
+def run_loaders(path: Path, *, cold: bool) -> tuple[dict[tuple[str, str], LoadPath], str]:
+    """Every (loader, cache-state) combination, each measured from a known cache state.
+
+    Also returns which eviction mechanism was used, because the note has to say: a cold run whose
+    method is unstated is indistinguishable from a warm run with a confident label.
+    """
     out: dict[tuple[str, str], LoadPath] = {}
     states = ("cold", "warm") if cold else ("warm",)
+    method = "none"
 
     for state in states:
         for name, loader in loaders.LOADERS.items():
             if state == "cold":
-                loaders.drop_page_cache()
+                method = loaders.go_cold(path)
             else:
                 # Warm means warm, which has to be established rather than assumed: a "warm" run
                 # straight after a cache drop is a cold run with a misleading label.
                 loader(path)
             out[(name, state)] = loader(path)
-    return out
+    return out, method
 
 
 def _print_loaders(results: dict[tuple[str, str], LoadPath]) -> None:
@@ -102,8 +107,24 @@ def _main() -> None:
 
     print(f"T10 — cold start, {nbytes / 1024**3:.2f} GiB payload, session {session}\n")
     print("stages 1-2: disk -> page cache -> process memory")
-    paths = run_loaders(path, cold=not args.no_cold)
+    paths, method = run_loaders(path, cold=not args.no_cold)
     _print_loaders(paths)
+    if not args.no_cold:
+        print(f"  cache evicted via {method}")
+
+        # The eviction is verified, not assumed. A major fault is a page fetched from the device;
+        # if the cold mmap run took none, the pages were still resident and the "cold" label is a
+        # lie. Cheap to check and it is the one thing that makes the cold column trustworthy.
+        cold_major = paths[("mmap", "cold")].major_faults
+        if cold_major == 0:
+            print(
+                "  WARNING: the cold mmap run took ZERO major faults, so its pages were already "
+                "resident. The eviction did not work and the cold column is not cold — do not "
+                "publish it."
+            )
+        else:
+            warm_major = paths[("mmap", "warm")].major_faults
+            print(f"  verified: cold took {cold_major:,} major faults, warm took {warm_major:,}")
 
     for (name, state), r in paths.items():
         for metric, value in (
