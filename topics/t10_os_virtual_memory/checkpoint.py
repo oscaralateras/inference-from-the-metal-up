@@ -72,13 +72,22 @@ def load_copied(paths: list[Path], device: torch.device) -> int:
 
     Byte-for-byte the same payload as the mapped path, moved the way `read` moves it — disk into
     the page cache, page cache into a process buffer, process buffer to the device.
+
+    `readinto` a preallocated buffer rather than `f.read()`, deliberately: `read()` returns an
+    immutable `bytes`, and `torch.frombuffer` needs a writable one, so the obvious spelling copies
+    the payload a second time and charges the copying loader for an artefact of Python's API. This
+    version pays exactly the one userspace copy the mechanism actually requires.
     """
     moved = 0
     for path in paths:
+        size = path.stat().st_size
+        buf = bytearray(size)
         with path.open("rb") as f:
-            blob = f.read()
-        moved += len(blob)
-        torch.frombuffer(bytearray(blob), dtype=torch.uint8).to(device, non_blocking=False)
+            got = f.readinto(memoryview(buf))
+        if got != size:
+            raise OSError(f"short read on {path}: {got} of {size} bytes")
+        moved += size
+        torch.frombuffer(buf, dtype=torch.uint8).to(device, non_blocking=False)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     return moved
