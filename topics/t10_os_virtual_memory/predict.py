@@ -75,6 +75,13 @@ MIN_COLD_WARM_RATIO = 3.0
 # note should not attribute it to the hardware. 60% is the line.
 MIN_SHARE_OF_STAGE_CEILING = 0.60
 
+# Not a band — a sanity gate on the measurement itself. If a cold run is not at least this much
+# slower than a warm one for the same loader, the eviction did not happen and the cold column is a
+# second warm column with a misleading heading. Set low deliberately: on fast NVMe a genuine cold
+# read is not dramatically slower, and the check must catch "no eviction at all" without also
+# rejecting "eviction worked, disk happens to be quick".
+MIN_COLD_SLOWDOWN = 1.5
+
 
 @dataclass(frozen=True)
 class Prediction:

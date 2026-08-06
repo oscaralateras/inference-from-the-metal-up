@@ -38,6 +38,7 @@ from topics.t10_os_virtual_memory.pipeline import (
 )
 from topics.t10_os_virtual_memory.predict import (
     MAX_MMAP_TRUE_SPEEDUP,
+    MIN_COLD_SLOWDOWN,
     MIN_COLD_WARM_RATIO,
     MIN_MMAP_APPARENT_SPEEDUP,
     MIN_PINNED_SPEEDUP,
@@ -112,19 +113,30 @@ def _main() -> None:
     if not args.no_cold:
         print(f"  cache evicted via {method}")
 
-        # The eviction is verified, not assumed. A major fault is a page fetched from the device;
-        # if the cold mmap run took none, the pages were still resident and the "cold" label is a
-        # lie. Cheap to check and it is the one thing that makes the cold column trustworthy.
-        cold_major = paths[("mmap", "cold")].major_faults
-        if cold_major == 0:
+        # The eviction is verified, not assumed — but NOT via major faults, which was the first
+        # attempt and was wrong on this hardware. `read()` never takes page faults at all (the
+        # kernel copies out of the page cache, so there is no mapping to fault on), and for `mmap`
+        # sequential readahead fetches pages before they are touched, turning what would have been
+        # blocking major faults into minor ones. The first pod recorded ONE major fault for 8 GiB
+        # that had genuinely just been evicted.
+        #
+        # The check that does work is the same loader against itself: a cold run must be markedly
+        # slower than a warm one. If it is not, the eviction no-oped and the cold column is a
+        # second warm column with a misleading heading.
+        cold_mmap, warm_mmap_ = paths[("mmap", "cold")], paths[("mmap", "warm")]
+        slowdown = (
+            cold_mmap.total_seconds / warm_mmap_.total_seconds if warm_mmap_.total_seconds else 0.0
+        )
+        if slowdown < MIN_COLD_SLOWDOWN:
             print(
-                "  WARNING: the cold mmap run took ZERO major faults, so its pages were already "
-                "resident. The eviction did not work and the cold column is not cold — do not "
-                "publish it."
+                f"  WARNING: the cold mmap run was only {slowdown:.2f}x slower than the warm one. "
+                "The eviction did not work and the cold column is not cold — do not publish it."
             )
         else:
-            warm_major = paths[("mmap", "warm")].major_faults
-            print(f"  verified: cold took {cold_major:,} major faults, warm took {warm_major:,}")
+            print(
+                f"  verified: cold mmap was {slowdown:.1f}x slower than warm, so the pages really "
+                "were evicted"
+            )
 
     for (name, state), r in paths.items():
         for metric, value in (
@@ -158,7 +170,7 @@ def _main() -> None:
             print(
                 f"  {size // 1024**2:>7} {s['pinned_gbps']:>9.2f} {s['pageable_gbps']:>9.2f} "
                 f"{s['pinned_over_pageable']:>6.2f}x {s['memcpy_gbps']:>9.2f} "
-                f"{s['predicted_pageable_gbps']:>9.2f}"
+                f"{s['serial_bound_gbps']:>9.2f}"
             )
             for metric, value in s.items():
                 rows.append(
@@ -190,12 +202,17 @@ def _main() -> None:
             f"{pinned_ratio:.2f}x vs >= {MIN_PINNED_SPEEDUP}  "
             f"{verdict(pinned_ratio >= MIN_PINNED_SPEEDUP)}"
         )
-        # The mechanism check, not a band: if the two-copy account is right, the serial
-        # combination of the DMA and the staging memcpy reproduces the measured pageable number.
-        err = abs(head["predicted_pageable_gbps"] - head["pageable_gbps"]) / head["pageable_gbps"]
+        # The mechanism check, not a band. The serial two-copy bound is what the pageable path
+        # would cost if the staging copy and the DMA took turns; measured sits above it by however
+        # much the runtime manages to overlap them, and that overlap is why "two copies" does not
+        # mean "half the bandwidth".
+        overlap = (
+            head["pageable_gbps"] / head["serial_bound_gbps"] if head["serial_bound_gbps"] else 0.0
+        )
         print(
-            f"    two-copy account predicts {head['predicted_pageable_gbps']:.2f} GB/s, "
-            f"measured {head['pageable_gbps']:.2f} — {err:.1%} apart"
+            f"    serial two-copy bound {head['serial_bound_gbps']:.2f} GB/s, "
+            f"measured {head['pageable_gbps']:.2f} — {overlap:.2f}x above it, "
+            "which is the staging copy being pipelined against the DMA rather than serialised"
         )
 
     def ratio(numerator: float, denominator: float) -> float:

@@ -11,11 +11,10 @@ The crossover is located from the measurements rather than eyeballed off a plot 
 finds where fusion's speedup overtakes graph capture's and interpolates between the bracketing
 points, in log space because the sweep is geometric.
 
-The chain-length control is what makes band 3 more than a curve fit. The byte model says the
-crossover is a property of the hardware and **not** of how many ops the chain has: the op count
-multiplies the traffic and the launch count equally, so it cancels. A 2-op chain and a 5-op chain
-should cross over at the same batch. If they don't, the model is wrong in a way that no amount of
-agreement at a single chain length would have revealed.
+The chain-length control is what makes band 3 more than a curve fit. Fusion removes `2k-3` round
+trips while capture removes `k` launches, so the model says a longer chain crosses over *earlier*,
+by exactly `(2*5-3)/(2*2-3)` = 7 going from five ops to two. That is a sharp number to be wrong
+against, and no amount of agreement at a single chain length would have tested it.
 """
 
 from __future__ import annotations
@@ -33,6 +32,7 @@ from topics.t11_compiler_runtime.chain import (
     CHAIN_OPS,
     DEFAULT_HIDDEN,
     fused_bytes,
+    fusion_crossover_batch,
     make_inputs,
     unfused_bytes,
 )
@@ -177,8 +177,8 @@ def _main() -> None:
     parser.add_argument(
         "--chain-lengths",
         default="",
-        help="band 3's control: extra op counts to repeat the sweep at. The byte model says the "
-        "crossover does not depend on chain length, so this is what can falsify it",
+        help="band 3's control: extra op counts to repeat the sweep at. The model predicts the "
+        "crossover moves by (2*5-3)/(2*ops-3), so this is what can falsify it",
     )
     args = parser.parse_args()
 
@@ -247,6 +247,40 @@ def _main() -> None:
             }
         )
 
+        # POST-HOC, and labelled as such: the band above is scored against the crossover predicted
+        # from an *assumed* 5 us launch cost, because nothing in this repo had measured one for a
+        # plain kernel. This run can measure it. The gap between eager and graph replay at a fixed
+        # batch is exactly the launch cost the capture removed, divided by the number of ops:
+        #
+        #     L = (eager - graph) / ops
+        #
+        # Feeding that back into the same unchanged formula is what separates "the model is wrong"
+        # from "the model's input was wrong". Only the second is a defensible thing to claim, and
+        # only if the recomputation is shown rather than described.
+        smallest = min(batches)
+        measured_launch_us = (per_batch[smallest]["eager"] - per_batch[smallest]["graph"]) / full
+        if measured_launch_us > 0:
+            remodelled = fusion_crossover_batch(peak_gbps, measured_launch_us, full, args.hidden)
+            print(
+                f"    launch cost measured at {measured_launch_us:.2f} us/op "
+                f"(assumed {prediction.assumed_launch_us:.1f}); the SAME model fed that predicts "
+                f"batch {remodelled:,.0f} against a measured {cross:,.0f}"
+            )
+            for metric, value in (
+                ("measured_launch_us", measured_launch_us),
+                ("remodelled_crossover_batch", remodelled),
+            ):
+                rows.append(
+                    {
+                        "session_id": session,
+                        "experiment": "crossover",
+                        "variant": "chain",
+                        "x": full,
+                        "metric": metric,
+                        "value": value,
+                    }
+                )
+
         # Bands 4 and 5 are scored at the top of the sweep, which is the only place the chain is
         # unambiguously bandwidth-bound. Below the crossover, comparing a launch-bound kernel to a
         # memory roof or to a byte model is comparing it to the wrong thing entirely.
@@ -256,6 +290,33 @@ def _main() -> None:
         print(
             f"(4) fused chain at batch {big}: {achieved:,.1f} GB/s = {share:.1%} of roof vs "
             f">= {MIN_SHARE_OF_MEMORY_ROOF:.0%}  {verdict(share >= MIN_SHARE_OF_MEMORY_ROOF)}"
+        )
+
+        # POST-HOC diagnostic, and the band above is NOT rescored against it. The band was
+        # registered against `compile`, which was the wrong mode to ask this question of: it runs
+        # the fused kernel *and* pays Dynamo's guard evaluation and the eager dispatch path on
+        # every call. That overhead is roughly constant, which is why `compile` times barely move
+        # across four decades of batch size while `compile_graph` scales with the work.
+        #
+        # So `compile`'s number is a property of the framework, not of the fuser's output.
+        # `compile_graph` runs the same generated kernel with the per-call overhead captured away,
+        # which is what "what bandwidth does the fused kernel reach" actually meant.
+        graphed = fused_bytes(big, args.hidden) / (per_batch[big]["compile_graph"] * 1e-6) / 1e9
+        overhead_us = per_batch[big]["compile"] - per_batch[big]["compile_graph"]
+        print(
+            f"    the same kernel, graph-replayed: {graphed:,.1f} GB/s = {graphed / peak_gbps:.1%} "
+            f"of roof — the band's {share:.1%} includes {overhead_us:.1f} us/call of guard and "
+            "dispatch overhead that is not the kernel"
+        )
+        rows.append(
+            {
+                "session_id": session,
+                "experiment": "mechanism",
+                "variant": "chain",
+                "x": big,
+                "metric": "graphed_fused_gbps",
+                "value": graphed,
+            }
         )
 
         predicted_ratio = unfused_bytes(big, args.hidden, full) / fused_bytes(big, args.hidden)

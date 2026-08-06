@@ -6,12 +6,15 @@ A GPU's DMA engine can only read from **pinned** host memory — pages the OS ha
 relocate. Ordinary pageable memory therefore cannot be a transfer source at all, so CUDA quietly
 copies it into a hidden pinned staging buffer first and DMAs from there.
 
-That is the whole mechanism, and it predicts the result before any measurement: the pageable path
-moves every byte **twice**, once through the CPU, so it should reach roughly half the bandwidth.
-Measuring the staging copy separately (`memcpy_gbps`) turns that from a story into an accounting
-identity, since the two halves have to add up:
+That is the whole mechanism, and the naive reading of it — every byte copied twice, so roughly half
+the bandwidth — is what band (1) pre-registered. Measuring the staging copy separately
+(`memcpy_gbps`) is what turns that from a story into something checkable:
 
-    1 / pageable_gbps  ~=  1 / pinned_gbps  +  1 / memcpy_gbps
+    serial bound:  1 / pageable  =  1 / pinned  +  1 / memcpy
+
+That is a **bound, not a prediction**, and the difference matters. The runtime chunks a pageable
+transfer and overlaps each staging copy with the previous chunk's DMA, so the measured rate lands
+above the serial line — which is exactly why "two copies" does not cost a factor of two.
 
 This module is also where the topic's most inference-relevant asymmetry appears. T7 measured
 1,736.7 GB/s **inside** the GPU. PCIe Gen4 x16 delivers a small fraction of that. Every weight in
@@ -79,23 +82,42 @@ def memcpy_gbps(nbytes: int) -> float:
     """Host-to-host copy bandwidth — the hidden staging copy, measured on its own.
 
     This is stage 3, and it is the stage no load-time benchmark reports because it happens inside
-    the CUDA runtime. Measuring it separately is what lets the note claim the pageable path is
-    "two copies" rather than merely asserting it: the serial combination of this and the pinned
-    transfer has to reproduce the measured pageable number.
+    the CUDA runtime.
+
+    **Single-threaded, and that is the measurement rather than a limitation.** The copy this stands
+    in for is the one the CUDA driver performs when the source is pageable, and that is a plain
+    serial `memcpy` inside the runtime — not a parallel one. Timing a 255-thread torch copy would
+    measure something the driver never does.
+
+    Pinning the thread count is also load-bearing for a second reason, found the hard way on the
+    first pod. This container reports **255 CPUs** through `sched_getaffinity` while actually being
+    limited to 16 by its cgroup, so torch defaulted to 255 threads and every `copy_` paid roughly
+    **80-100 ms of pure thread-pool scheduling, independent of size**. The signature was
+    unmistakable once seen: reported bandwidth scaling *linearly with buffer size* across three
+    decades, which is what a constant time per call looks like when you divide bytes by it. At
+    256 MiB it read 3.3 GB/s against a true single-threaded 12.9.
     """
     src = torch.empty(nbytes, dtype=DTYPE)
     dst = torch.empty(nbytes, dtype=DTYPE)
     cpu = torch.device("cpu")
 
-    ms = time_op(lambda: dst.copy_(src), cpu)
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        ms = time_op(lambda: dst.copy_(src), cpu)
+    finally:
+        torch.set_num_threads(previous)
     return nbytes / (ms * 1e-3) / 1e9
 
 
 def series_gbps(*stages: float) -> float:
-    """Combine stage bandwidths in series: reciprocals add, because the times do.
+    """Combine stage bandwidths as if they ran strictly in series: reciprocals add.
 
-    Used to check the two-copy account of the pageable path against the pageable path as measured.
-    If they disagree, the mechanism is not what this module says it is.
+    This is the *serial bound* on the pageable path — what it would cost if the staging copy and
+    the DMA took turns. It is deliberately a bound rather than a prediction, because the CUDA
+    runtime chunks the transfer and overlaps the two, so the measured pageable rate should land
+    **above** this line. The size of that gap is how much overlap the runtime achieves, and it is
+    the reason band (1)'s "two copies means half the bandwidth" intuition over-predicts the penalty.
     """
     total = sum(1.0 / g for g in stages if g > 0)
     return 1.0 / total if total > 0 else 0.0
@@ -113,9 +135,10 @@ def sweep(device: torch.device) -> dict[int, dict[str, float]]:
             "pageable_gbps": pageable,
             "memcpy_gbps": staging,
             "pinned_over_pageable": pinned / pageable if pageable else 0.0,
-            # What the two-copy account predicts the pageable path should reach. Compared against
-            # the measured pageable number in the note; agreement is the mechanism check.
-            "predicted_pageable_gbps": series_gbps(pinned, staging),
+            # The serial two-copy bound. Measured pageable should sit ABOVE this, because the
+            # runtime overlaps the staging copy with the DMA rather than taking turns; how far
+            # above is how much overlap it achieves.
+            "serial_bound_gbps": series_gbps(pinned, staging),
         }
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -135,15 +158,13 @@ def _main() -> None:
 
     device = torch.device(args.device)
     print(f"T10 stages 3-4 — host to {torch.cuda.get_device_name(device)}\n")
-    print(
-        f"{'MiB':>7}  {'pinned':>9}  {'pageable':>9}  {'ratio':>6}  {'memcpy':>9}  {'predicted':>9}"
-    )
+    print(f"{'MiB':>7}  {'pinned':>9}  {'pageable':>9}  {'ratio':>6}  {'memcpy':>9}  {'serial':>9}")
 
     for nbytes, stats in sweep(device).items():
         print(
             f"{nbytes // 1024**2:>7}  {stats['pinned_gbps']:>7.2f}    "
             f"{stats['pageable_gbps']:>7.2f}  {stats['pinned_over_pageable']:>5.2f}x  "
-            f"{stats['memcpy_gbps']:>7.2f}    {stats['predicted_pageable_gbps']:>7.2f}"
+            f"{stats['memcpy_gbps']:>7.2f}    {stats['serial_bound_gbps']:>7.2f}"
         )
 
 

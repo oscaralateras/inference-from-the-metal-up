@@ -78,7 +78,12 @@ def plot_h2d(rows: list[dict[str, str]]) -> bool:
     for metric, style, colour, label in (
         ("pinned_gbps", "o-", "#1f77b4", "pinned — DMA reads it directly"),
         ("pageable_gbps", "o-", "#d62728", "pageable — staged through a hidden pinned buffer"),
-        ("predicted_pageable_gbps", ":", "#555555", "what two copies in series predict"),
+        (
+            "serial_bound_gbps",
+            ":",
+            "#555555",
+            "serial two-copy bound — measured beats it via overlap",
+        ),
         ("memcpy_gbps", "--", "#2ca02c", "the staging copy alone (host to host)"),
     ):
         points = select(rows, "h2d", "transfer", metric)

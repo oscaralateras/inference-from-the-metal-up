@@ -38,7 +38,7 @@ T10_METRICS = {
     "pageable_gbps",
     "memcpy_gbps",
     "pinned_over_pageable",
-    "predicted_pageable_gbps",
+    "serial_bound_gbps",
     "stage_gbps",
     "stage_seconds",
     "cold_start_seconds",
@@ -53,6 +53,9 @@ T11_METRICS = {
     "fused_gbps",
     "byte_model_speedup",
     "crossover_batch",
+    "measured_launch_us",
+    "remodelled_crossover_batch",
+    "graphed_fused_gbps",
 }
 T6_METRICS = {
     "tokens_per_sec",
