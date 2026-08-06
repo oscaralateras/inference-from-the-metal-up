@@ -44,6 +44,19 @@ BYTES_PER_ELEMENT = 2  # bfloat16, as everywhere else in this repo
 # the region `torch.compile` is best at and hand-written kernels usually skip.
 CHAIN_OPS = ("rmsnorm", "residual_add", "silu", "gate_mul", "rotary_half")
 
+# The same chain with its fifth op swapped for one that actually fuses.
+#
+# This exists because the measured run found `rotary_half` emits a **second kernel** under
+# Inductor — the `cat` materialises rather than fusing away — while the 2- and 3-op truncations
+# both collapse to one. That confounds the band 3 control: "longer chain" and "less completely
+# fused" move together, so the control cannot say which one flattened the crossover.
+#
+# Swapping the rotation for a second RMSNorm — the next block's post-attention norm, equally real
+# and equally weightless — holds the op count at five while removing the `cat`. Same byte model,
+# same length, one kernel instead of two. The difference between the two 5-op chains is then
+# fusion completeness and nothing else.
+FUSING_CHAIN_OPS = ("rmsnorm", "residual_add", "silu", "gate_mul", "post_norm")
+
 # How many distinct tensors the chain reads at the boundary (the hidden state and the residual)
 # and writes at the boundary (the output). Fusion cannot remove these — they are the chain's
 # contract with the rest of the model, not its internals.
@@ -180,6 +193,7 @@ def decode_chain(
     gate: torch.Tensor,
     w: torch.Tensor,
     ops: int = len(CHAIN_OPS),
+    fusing: bool = False,
 ) -> torch.Tensor:
     """The chain itself: up to five weightless ops, written the way a model file writes them.
 
@@ -214,6 +228,13 @@ def decode_chain(
     out = out * gate
     if ops == 4:
         return out
+
+    if fusing:
+        # The next block's post-attention RMSNorm. Same cost class as the rotation and the same
+        # place in a real block, but pure arithmetic over the existing layout — nothing for
+        # Inductor to materialise, so the whole chain collapses to one kernel.
+        post_variance = out.pow(2).mean(-1, keepdim=True)
+        return out * torch.rsqrt(post_variance + 1e-6) * w
 
     # A rotary-style half-rotation: cheap arithmetic, another full round trip when unfused.
     first, second = out.chunk(2, dim=-1)

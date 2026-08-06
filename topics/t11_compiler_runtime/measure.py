@@ -79,7 +79,12 @@ def crossover_batch(batches: list[int], fusion: list[float], graphs: list[float]
 
 
 def run_sweep(
-    ops: int, batches: list[int], hidden: int, device: torch.device, modes: list[str]
+    ops: int,
+    batches: list[int],
+    hidden: int,
+    device: torch.device,
+    modes: list[str],
+    fusing: bool = False,
 ) -> tuple[dict[int, dict[str, float]], list[float], list[float], dict[int, dict[str, int]]]:
     """Time every mode at every batch for one chain length."""
     per_batch: dict[int, dict[str, float]] = {}
@@ -88,7 +93,7 @@ def run_sweep(
     graph_speedups: list[float] = []
 
     header = "  ".join(f"{m:>13}" for m in modes)
-    print(f"\nchain length {ops} of {len(CHAIN_OPS)}")
+    print(f"\nchain length {ops} of {len(CHAIN_OPS)}{' (all-fusing variant)' if fusing else ''}")
     print(f"{'batch':>7}  {header}  {'fusion':>7} {'graphs':>7} {'both':>7}")
 
     for batch in batches:
@@ -97,7 +102,7 @@ def run_sweep(
         counts: dict[str, int] = {}
 
         for mode in modes:
-            fn = build_mode(mode, inputs, device, ops=ops)
+            fn = build_mode(mode, inputs, device, ops=ops, fusing=fusing)
             times[mode] = time_op(fn, device, inner=CALLS_PER_TIMING) * 1e3
             counts[mode] = count_kernel_launches(fn, device)
 
@@ -124,10 +129,12 @@ def _rows(
     per_batch: dict[int, dict[str, float]],
     launches: dict[int, dict[str, int]],
     modes: list[str],
+    suffix: str | None = None,
 ) -> list[dict[str, object]]:
     """One row per observation. Chain length is part of the variant, so the control's sweeps sit
     alongside the main one instead of overwriting it."""
-    suffix = "" if ops == len(CHAIN_OPS) else f"_ops{ops}"
+    if suffix is None:
+        suffix = "" if ops == len(CHAIN_OPS) else f"_ops{ops}"
     rows: list[dict[str, object]] = []
 
     for batch, times in per_batch.items():
@@ -179,6 +186,13 @@ def _main() -> None:
         default="",
         help="band 3's control: extra op counts to repeat the sweep at. The model predicts the "
         "crossover moves by (2*5-3)/(2*ops-3), so this is what can falsify it",
+    )
+    parser.add_argument(
+        "--all-fusing",
+        action="store_true",
+        help="repeat the sweep with the 5-op chain whose fifth op fuses (post-norm instead of the "
+        "rotary cat). Holds chain length fixed and changes only fusion completeness, which is the "
+        "confound the first control could not separate",
     )
     args = parser.parse_args()
 
@@ -354,6 +368,33 @@ def _main() -> None:
                     "x": ops,
                     "metric": "crossover_batch",
                     "value": ctrl_cross,
+                }
+            )
+
+        # The second control, and the one that separates the two explanations the first could not.
+        # Same five ops, same byte model, same everything — except the fifth op fuses. If the
+        # crossover still barely moves, chain length genuinely does not drive it. If it moves, the
+        # first control was measuring incomplete fusion and calling it chain length.
+        if args.all_fusing:
+            fus_batch, fus_fusion, fus_graphs, fus_launches = run_sweep(
+                full, batches, args.hidden, device, modes, fusing=True
+            )
+            fus_cross = crossover_batch(batches, fus_fusion, fus_graphs)
+            print(
+                f"    all-fusing 5-op chain: crossover at batch {fus_cross:,.0f} — "
+                f"{(fus_cross / cross if cross else 0.0):.2f}x the rotary 5-op result"
+            )
+            rows += _rows(
+                session, full, args.hidden, fus_batch, fus_launches, modes, suffix="_fusing"
+            )
+            rows.append(
+                {
+                    "session_id": session,
+                    "experiment": "crossover",
+                    "variant": "chain_fusing",
+                    "x": full,
+                    "metric": "crossover_batch",
+                    "value": fus_cross,
                 }
             )
 

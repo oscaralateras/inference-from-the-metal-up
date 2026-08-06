@@ -48,7 +48,9 @@ def assert_fusion_is_not_secretly_graphs() -> None:
         )
 
 
-def build_callable(inputs: ChainInputs, *, compiled: bool, ops: int) -> Callable[[], torch.Tensor]:
+def build_callable(
+    inputs: ChainInputs, *, compiled: bool, ops: int, fusing: bool = False
+) -> Callable[[], torch.Tensor]:
     """A zero-argument callable running the chain on fixed inputs, eager or compiled."""
     fn = decode_chain
     if compiled:
@@ -56,7 +58,7 @@ def build_callable(inputs: ChainInputs, *, compiled: bool, ops: int) -> Callable
         fn = torch.compile(decode_chain)
 
     def run() -> torch.Tensor:
-        return fn(inputs.hidden_state, inputs.residual, inputs.gate, inputs.weight, ops)
+        return fn(inputs.hidden_state, inputs.residual, inputs.gate, inputs.weight, ops, fusing)
 
     return run
 
@@ -85,13 +87,17 @@ def capture(fn: Callable[[], torch.Tensor], device: torch.device) -> Callable[[]
 
 
 def build_mode(
-    mode: str, inputs: ChainInputs, device: torch.device, ops: int = len(CHAIN_OPS)
+    mode: str,
+    inputs: ChainInputs,
+    device: torch.device,
+    ops: int = len(CHAIN_OPS),
+    fusing: bool = False,
 ) -> Callable[[], object]:
     """One of the four cells, ready to time. Identical inputs across all four by construction."""
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}, expected one of {MODES}")
 
-    fn = build_callable(inputs, compiled=mode.startswith("compile"), ops=ops)
+    fn = build_callable(inputs, compiled=mode.startswith("compile"), ops=ops, fusing=fusing)
 
     for _ in range(WARMUP_CALLS):
         fn()
