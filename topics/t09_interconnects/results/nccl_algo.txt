@@ -1,0 +1,26 @@
+NCCL algorithm and protocol selection by message size.
+Captured with NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=TUNING on the 4x A100-SXM4-80GB
+NV12 node, NCCL 2.27.3, torch 2.8.0+cu128, session f3f296a657bc.
+
+This is the evidence behind band (1)'s failure. The ring IS used at every size --
+the algorithm was never the issue. What changes with size is the *protocol* and,
+decisively, the number of channels:
+
+  AllReduce:         4 Bytes -> Algo RING proto LL     channel{Lo..Hi}={0..0}
+  AllReduce:     5,756 Bytes -> Algo RING proto LL     channel{Lo..Hi}={0..0}
+  AllReduce:   182,092 Bytes -> Algo RING proto LL     channel{Lo..Hi}={0..9}
+  AllReduce: 5,758,372 Bytes -> Algo RING proto LL128  channel{Lo..Hi}={0..23}
+  AllReduce: 182,095,808 Bytes -> Algo RING proto SIMPLE channel{Lo..Hi}={0..23}
+
+  24 coll channels, 24 collnet channels, 0 nvls channels, 32 p2p channels
+  NVLS multicast support is not available on dev 0 (NVLS_NCHANNELS 0)
+
+A decode all-reduce at batch 1 is 7,168 B, which lands in the first regime:
+the LL protocol on a SINGLE channel out of the 24 the node has. It is not using
+1/24th of the bandwidth by accident of message size alone -- it is using 1/24th
+of the fabric's parallelism by NCCL's own tuning decision, because at that size
+spreading across channels would cost more in synchronisation than it saves.
+
+NVLS is unavailable on this node, so the multicast path that would collapse the
+ring entirely was never an option here. On a node where it is available the
+small-message numbers could differ, and this topic has not tested that.

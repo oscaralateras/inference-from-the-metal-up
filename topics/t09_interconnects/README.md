@@ -1,177 +1,228 @@
 # T9 — Interconnects: what a collective costs when the message is small
 
-**Status: harness complete, bands registered, not yet measured.** Everything below the line is
-committed *before* the GPU node exists. The numbers in the Results section are blank on purpose —
-they get filled in from one session on a 4× A100 NVLink box, pass or fail.
-
 **Question:** T5 measured tensor parallelism end to end and found that its communication *volume*
 does not explain its cost — 940 MB per step is only ~4% of the step at NVLink bandwidth, yet TP
-scaled worst of the three dense strategies. T5's conclusion was that the loss is "frequency and
-shape" rather than volume. **So what does one all-reduce actually cost, and how much of that cost
-is there before it moves a single byte?**
+scaled worst of the three dense strategies. T5 called the loss "frequency and shape" rather than
+volume. **So what does one all-reduce actually cost, and how much of that cost is there before it
+moves a single byte?**
+
+**Setup:** 4× NVIDIA A100-SXM4-80GB, **NV12 NVLink between every pair** (12 bonded links), NCCL
+2.27.3, torch 2.8.0+cu128, bfloat16. Measured memory bandwidth **1,739.2 GB/s** — T6, T7 and T8 ran
+at 1,737 GB/s, so this is the same silicon to within 0.1% and the numbers below compose with theirs
+directly. Session `f3f296a657bc`. Model shape throughout is Qwen2.5-7B (hidden 3584, 28 layers), as
+in T5–T8.
 
 ---
 
+## Result
+
+![the cost curve](results/allreduce_cost.png)
+
+**A decode all-reduce is 99.9% fixed cost, and that fixed cost has almost nothing to do with the
+interconnect.**
+
+A collective is priced as `t(n) = α + n/β`. Fitted on this node:
+
+| | α (fixed) | β (bandwidth) | R² | crossover | β vs NV12 spec |
+|---|---|---|---|---|---|
+| 2 GPUs | **35.45 µs** | 201.5 GB/s | 0.9997 | 6,978 KB | 67.2% |
+| 4 GPUs | **35.80 µs** | 221.7 GB/s | 0.9999 | 5,168 KB | 73.9% |
+
+Decode at batch 1 sends **7,168 B**. That is three orders of magnitude below the crossover, so the
+call costs 35.85 µs of which **99.9% is α**. It achieves **0.300 GB/s of bus bandwidth — 0.135% of
+the 221.7 GB/s the same link delivers to a large message.**
+
+Fifty-six of those per token (2 per layer × 28 layers) is **2.01 ms**, against T6's measured 11.05 ms
+step: an **18.2% tax** on a step that tensor parallelism is supposed to be shrinking.
+
+| pre-registered band | predicted | measured | verdict |
+|---|---|---|---|
+| 1. α(4)/α(2), from ring `2(N-1)` | 3.0 ± 30% | **1.01** | **OUTSIDE** ✗ |
+| 2. β vs NV12 spec, world 2 | ≥ 70% | 67.2% | **OUTSIDE** ✗ |
+| 2. β vs NV12 spec, world 4 | ≥ 70% | **73.9%** | WITHIN ✓ |
+| 3. batch-1 call is fixed cost | ≥ 90% | **99.9%** | WITHIN ✓ |
+| 4. model vs real TP layer, world 4 | within 1.5× | 0.83–1.06× | WITHIN ✓ |
+| 4. model vs real TP layer, world 2 | within 1.5× | **0.47–0.66×** | **OUTSIDE** ✗ |
+
+Three of six failed. Band 1 failed by the widest margin and turned out to be the most useful thing
+here, so the rest of this note is mostly about it.
+
+---
+
+## Band 1: α did not scale, and the reason is not the ring
+
+The ring model says an all-reduce costs `2(N-1)` dependent hops, so going 2 → 4 GPUs should triple
+the fixed cost. It didn't move at all: **35.45 → 35.80 µs, a ratio of 1.01.**
+
+Solving `α = L + 2(N-1)·h` across the two world sizes separates a size-independent floor from a
+per-hop term:
+
+    L = 35.28 µs        the floor — paid once, regardless of world size
+    h = 0.087 µs        per dependent hop
+
+At 4 GPUs the six hops contribute **1.5% of α**. The ring is there; it is simply not what you are
+paying for.
+
+The obvious suspicion is that NCCL wasn't running a ring at all — it switches to tree algorithms for
+small payloads on some topologies. So I asked it, with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=TUNING`
+(full capture in [`results/nccl_algo.txt`](results/nccl_algo.txt)):
+
+```
+AllReduce:           4 Bytes -> Algo RING proto LL     channel{Lo..Hi}={0..0}
+AllReduce:       5,756 Bytes -> Algo RING proto LL     channel{Lo..Hi}={0..0}
+AllReduce:     182,092 Bytes -> Algo RING proto LL     channel{Lo..Hi}={0..9}
+AllReduce:   5,758,372 Bytes -> Algo RING proto LL128  channel{Lo..Hi}={0..23}
+AllReduce: 182,095,808 Bytes -> Algo RING proto SIMPLE channel{Lo..Hi}={0..23}
+```
+
+It is a ring, at every size. What changes is the protocol and — decisively — **the channel count**.
+The node has 24 collective channels. A decode-sized message uses **one of them**.
+
+So the mechanism is: at 7 KB, NCCL runs the low-latency protocol on a single channel, because
+spreading such a small payload across 24 channels would cost more in synchronisation than it saves.
+The cost that remains is launch and synchronisation, which is why it does not care how many GPUs are
+in the ring.
+
+**This is the same lesson as T8, on different hardware.** T8 found a batch-1 GEMV bound by work per
+weight rather than by bytes. Here a collective is bound by per-call overhead rather than by the wire.
+Decode makes every operation small, and small operations are priced by their fixed costs — which is
+also the hypothesis T11 will test directly on kernel launches.
+
+## Band 2: the link is not the constraint either
+
+β reaches 67.2% of NV12's 300 GB/s spec at 2 GPUs and 73.9% at 4. The 2-GPU number misses the band.
+
+Worth noting the direction: **4 GPUs achieve *more* bus bandwidth than 2**, which is the opposite of
+the naive expectation that a longer ring is worse. Bus bandwidth already contains the `2(N-1)/N`
+factor, so a wider ring genuinely uses more of the fabric — with two GPUs there are simply fewer
+paths in play. The band's denominator is a datasheet figure, and 67% vs 74% of it is a much smaller
+story than the four orders of magnitude separating decode from the regime where β matters at all.
+
+## What this predicts for tensor parallelism
+
+Amdahl with a communication penalty, using T6's measured error budget (weight share **73.7%**, step
+**11.05 ms**, **90.5 tok/s**), read from `t06/results/perf.csv` at runtime rather than retyped:
+
+    speedup = 1 / ( (1-w) + w/N + comms_per_token/step )
+
+| batch | comms/token, TP2 | TP2 | comms/token, TP4 | TP4 |
+|---|---|---|---|---|
+| 1 | 1,987 µs | **1.23×** | 2,008 µs | **1.59×** |
+| 8 | 250 µs | 1.53× | 253 µs | 2.13× |
+| 32 | 64 µs | 1.57× | 65 µs | 2.21× |
+| 128 | 17.5 µs | 1.58× | 18.4 µs | 2.23× |
+
+![sharding buys least where latency matters most](results/decode_tax.png)
+
+Two things fall out, and they point in opposite directions from the pre-registered story:
+
+**Sharding wider is nearly free in latency terms.** I predicted TP4 would be punished because α would
+triple. It doesn't, so TP4 beats TP2 at every batch size. The prediction registered before the run
+said 1.49× and 1.76×, from an assumed α of 8 µs; the measured α of ~35 µs makes batch 1 *worse* than
+predicted at TP2 and *better* at TP4, because the assumed model had the world-size scaling backwards.
+
+**Batching is what pays for the collectives.** The fixed cost is per call, not per token, so it
+amortises: 1,987 µs/token at batch 1 becomes 17.5 µs at batch 128. TP2 goes 1.23× → 1.58× on that
+alone. Same conclusion T6 and T7 reached by different routes — batch first.
+
+## Band 4: measured on a real layer, and half of it disagrees
+
+The fit above comes from an all-reduce running alone, with nothing else on the GPU and the same
+buffer every time — the cleanest possible setting and therefore the most flattering. Stage 3 runs the
+actual thing: a row-parallel down-projection (K=18944, N=3584, T7 and T8's shape), taking the
+collective's cost as *step with it* minus *step without it*.
+
+| | batch 1 | batch 128 |
+|---|---|---|
+| TP2 measured speedup | **1.36×** (comms 27.8% of step) | 1.22× (28.6%) |
+| TP4 measured speedup | **1.49×** (comms 58.2% of step) | 1.54× (47.6%) |
+
+Against the fitted model:
+
+| | b1 | b8 | b32 | b128 |
+|---|---|---|---|---|
+| world 4, measured/predicted | 1.06× | 1.03× | 0.99× | 0.83× |
+| world 2, measured/predicted | **0.56×** | **0.47×** | **0.55×** | **0.66×** |
+
+**At 4 GPUs the microbenchmark predicts a real layer's communication to within a few percent.** At 2
+GPUs it over-predicts by roughly a factor of two — the collective inside real work is *faster* than
+the same collective measured alone.
+
+I don't know why, and I am not going to pick whichever explanation sounds best. The candidates:
+
+- **Overlap.** The difference method attributes to comms anything the all-reduce cannot hide behind
+  the matmul. At TP2 each rank's matmul is twice the size it is at TP4 (51.9 µs vs 27.5 µs at
+  batch 1), so there is more work for the collective's launch to overlap with. This predicts the
+  effect shrinks as the matmul shrinks, and TP4's agreement is consistent with that.
+- **A different code path at N=2.** With a single peer, a "ring" is a bidirectional exchange, and
+  NCCL may take a cheaper path than the general one the isolated sweep exercised.
+
+Separating them needs a run I did not do: the same measurement with `NCCL_ALGO` pinned, plus an
+Nsight timeline showing whether the collective actually overlaps. **That is the next thing I would
+measure.** Until then band 4 is recorded as failed at world 2.
+
 ## Why this is not T5 again
 
-A collective is not priced in bytes. It is priced as
-
-    t(n) = α + n / β
-
-`α` is what the call costs before any useful byte moves: kernel launch, ring setup, and `2(N-1)`
-dependent hops each of which must complete before the next begins. `β` is the rate once it is
-moving. Every all-reduce pays both, and which one dominates is decided entirely by `n`.
-
-T5 and decode sit on **opposite ends of that curve**, and this is the whole reason the topic
-exists:
+Both topics run NCCL collectives on 4× A100 NVLink and both concern tensor parallelism. The split is
+by regime, and it is the reason this topic exists:
 
 | | payload per all-reduce | regime |
 |---|---|---|
 | T5's TP, batch 16 × seq 512 | **58,720,256 B** | far out on `n/β` — bandwidth-bound |
-| Decode, batch 1 | **7,168 B** | entirely inside `α` — latency-bound |
-| Decode, batch 128 | 917,504 B | crossing over |
+| Decode, batch 1 | **7,168 B** | entirely inside α — latency-bound |
 
-**8,192×** apart. T5 measured the fast end. Inference runs at the slow one, and the fabric's
-headline bandwidth number describes a regime decode never enters. A test in
-`tests/test_distinctness.py` asserts that separation rather than leaving it as a claim in prose.
+**8,192× apart.** T5 measured the fast end; inference runs at the slow one.
+`tests/test_distinctness.py` asserts that separation and the disjointness of the two metric
+vocabularies, so the claim is enforced rather than promised.
 
-## Why α should grow with world size
+## Method notes
 
-NCCL's bandwidth-optimal algorithm is a ring: reduce-scatter over `N-1` steps, then all-gather over
-another `N-1`. Each step ships `n/N` bytes to one neighbour:
+**The topology gate aborts rather than warns, and checks twice.** A rented node whose GPUs lack
+NVLink produces no error — just a bandwidth roughly 10× low that would land here as a fact about
+NVLink. The declared check parses `nvidia-smi topo -m`; the empirical one moves 256 MB and requires
+≥ 100 GB/s (measured: 172.6 GB/s at world 2, 192.9 GB/s at world 4). The matrix is a claim; only the
+measurement is evidence. Both are recorded in [`results/topology.txt`](results/topology.txt).
 
-    hops       = 2(N-1)              dependent, so 2(N-1) latencies in series
-    wire bytes = 2(N-1)/N · n        the "bus" volume NCCL reports
+The gate earned this on its first contact with real hardware, by failing for the wrong reason:
+`nvidia-smi` underlines its header row with an ANSI escape even when its output is piped, so the
+header was skipped and the **GPU0 data row was mistaken for it** — leaving only GPU0's pairs in the
+matrix. That passed at world 2 and failed at world 4, which reads exactly like a partially-connected
+node. The pod was fine. The regression test is now that pod's matrix, captured verbatim with the
+escape and all ten NIC columns intact; the fixtures that missed it were hand-written from what the
+output *looks like* rather than from what it is.
 
-    t(n, N) = 2(N-1)·α_step  +  2(N-1)/N · n/β_link
+**α and β are fitted from separate regions.** A single least-squares fit across the whole sweep
+recovered 13.2 µs from a synthetic curve built with α = 7.5 µs — a 76% error in this topic's headline
+number, because across six decades the top decade takes almost all the leverage. α is now the median
+of the flat floor (≤ 16 KB); β is the slope of the ramp (≥ 4 MB), whose intercept is discarded; R² is
+the ramp's, so an algorithm switch shows up rather than averaging into a confident wrong bandwidth.
+`test_t09.py` builds curves from known parameters and checks the estimator recovers them.
 
-Two things fall straight out, and both are pre-registered below:
+**Steady state, and the slowest rank.** Each timing window holds 16 back-to-back collectives — a
+35 µs call timed alone would report the dispatch path, and a TP decode step fires 56 in sequence
+anyway. Every measurement is reduced across ranks with `MAX`, because a collective is a barrier and
+its cost is the cost to its slowest participant.
 
-1. **The fixed cost scales as `2(N-1)`, not `N`.** Going 2 → 4 GPUs should multiply α by **3.0**.
-   If decode is α-bound, sharding wider costs *more per call* while each call still carries the
-   same bytes — the cost goes up and the payload does not.
-2. **The moving cost saturates.** `2(N-1)/N` runs 1.0 → 1.5 → 1.75 → 2.0, so wire traffic
-   approaches twice the payload however wide the ring gets.
+## Caveats
 
----
-
-## Pre-registered bands
-
-Committed in `results/predictions.json` before the node was rented. Reported WITHIN/OUTSIDE either
-way — T8 failed two of three and was a better note for it.
-
-| # | band | predicted | measured | verdict |
-|---|---|---|---|---|
-| 1 | α(4)/α(2), from `2(N-1)` | **3.0** ± 30% | — | — |
-| 2 | asymptotic bus bandwidth vs the node's NVLink spec | **≥ 70%** | — | — |
-| 3 | batch-1 all-reduce is fixed cost | **≥ 90%** | — | — |
-| 4 | fitted model predicts a real TP layer's comms | within **1.5×** | — | — |
-
-Bands 1–3 are *structural* — they follow from the ring algorithm alone, so they could be committed
-to without knowing anything about the hardware, which is what makes them worth pre-registering.
-Band 4 is the one that can genuinely fail for an interesting reason: a two-term model fitted to an
-isolated microbenchmark is only worth anything if it survives contact with a collective embedded in
-real work.
-
-### The prediction it implies
-
-From T6's measured error budget, read out of `t06/results/perf.csv` at runtime rather than retyped
-(weight share **73.7%**, step **11.05 ms**, **90.5 tok/s**), and an **assumed** α of 8 µs — the one
-term not yet measured, and flagged as assumed everywhere it appears:
-
-| | comms/token | predicted TP speedup |
-|---|---|---|
-| TP2 | 448.8 µs | **1.49×** |
-| TP4 | 1,345.3 µs | **1.76×** |
-
-Not 2× and 4×. Two GPUs double the memory bandwidth that T6 showed decode is bound by, but the
-collectives are 56 fixed-cost calls per token, and at TP4 that fixed cost triples while the payload
-stays 7 KB. **The prediction is that sharding buys least exactly where latency matters most** — and
-the measurement is what decides whether that is right.
-
-The speedup model is Amdahl with a comms penalty, the same law T5 calibrated and T8 reused:
-
-    speedup = 1 / ( (1-w) + w/N + comms_per_token/step )
-
-It is deliberately **optimistic** and should be read as an upper bound. It holds the non-weight 26%
-fixed under sharding, which T5 measured to be false: each rank runs a matmul 1/N the size and gets
-proportionally less from the GPU, and every all-reduce is a barrier that costs the slowest rank's
-jitter. Both push the real number down. An optimistic prediction that still lands near the
-measurement is a stronger result than a hedged one that cannot be wrong.
-
----
-
-## Results
-
-*Blank until the session runs.*
-
-![the cost curve](results/allreduce_cost.png)
-
----
-
-## Method, and the one thing that would invalidate all of it
-
-**The topology gate.** A rented multi-GPU node is not guaranteed to have NVLink between the GPUs
-you were given. The symptom is not an error — it is a plausible bandwidth number roughly 10× too
-low, which would land in this note as a fact about NVLink. That is the single failure mode that
-would invalidate the topic, so the gate runs first and **aborts** rather than warns:
-
-1. **Declared** — parse `nvidia-smi topo -m`, require `NV#` between every pair in the world.
-   Catches GPUs on separate PCIe root complexes (`SYS`, `NODE`, `PHB`).
-2. **Empirical** — actually move 256 MB and require ≥ 100 GB/s of bus bandwidth. Catches what the
-   matrix cannot: virtualised or mislabelled topology, a link that negotiated down, and NCCL
-   declining to use NVLink for its own reasons.
-
-The matrix is a claim; the second one is a measurement, and only one of those is evidence. Both
-are recorded to `results/topology.txt`, because the fabric is part of the result — a reader who
-cannot see which wire produced a bandwidth number has to take it on trust.
-
-**Fitting α and β separately, from the two regions that constrain them.** The first version of the
-estimator ran one least-squares fit across the whole sweep. Feeding it a synthetic curve built with
-a known α = 7.5 µs recovered **13.2 µs** — a 76% error in the one number this topic exists to
-report. Across six decades of message size, OLS on raw bytes gives the top decade almost all the
-leverage. So:
-
-- **α** is the median of the flat floor (≤ 16 KB), where the moving term is ~0.05 µs and the
-  region's height *is* α. Median rather than mean because one scheduler hiccup is a large outlier
-  at microsecond scale.
-- **β** is the slope over the ramp (≥ 4 MB) only. That fit's intercept is discarded —
-  extrapolating a line fitted at hundreds of megabytes back to zero measures nothing.
-- **R²** is the ramp's, so it answers the question actually being asked: is the large-message
-  region a straight line, or did NCCL switch between tree and ring partway up? That switch is real,
-  and averaging across it would produce a confident bandwidth describing neither regime.
-
-`test_t09.py` builds curves from known parameters and checks the estimator recovers them, the same
-move T5 made with Amdahl. An estimator not tested against a known answer is a number generator.
-
-**Steady state, and the slowest rank.** Each timing window holds 16 back-to-back collectives, for
-the same reason T8 batches its launches: a small all-reduce takes single-digit microseconds, so
-timing one alone reports the dispatch path. It is also faithful — a TP decode step fires 56 of
-these in sequence. Every measurement is reduced across ranks with `MAX`, because a collective is a
-barrier and its cost is the cost to its slowest participant; timing rank 0 alone would report
-whichever rank was luckiest.
-
-**Stage 3 measures the collective in situ.** `measure.py` times an all-reduce with nothing else on
-the GPU and the same buffer every time — the cleanest possible setting, and therefore the most
-flattering. `tp_matmul.py` runs a real row-parallel down-projection (Qwen2.5-7B's K=18944,
-N=3584 — T7 and T8's shape) and takes the collective's cost as *step with it minus step without
-it*. World size 1 is the control: identical code path, no collective.
-
-## Caveats, stated in advance
-
-- **4-way measured, and nothing beyond it is claimed.** 8-way brings NVSwitch behaviour this
-  configuration cannot observe. The `2(N-1)` model predicts further out; this topic will not have
-  tested it there.
-- **The TP speedup figures are modelled, not a re-run of vLLM.** They compose T6's error budget
-  with a measured α. Labelled as modelled wherever they appear. Stage 3 measures a single layer's
-  collective, not an end-to-end serving stack.
-- **Synthetic tensors.** The collective's cost depends on the shape and the fabric, not the values,
-  exactly as in T7 and T8.
+- **4-way measured; nothing beyond it is claimed.** 8-way brings NVSwitch behaviour this
+  configuration cannot observe.
+- **NVLS was unavailable on this node** (`NVLS_NCHANNELS 0`). The multicast path that could collapse
+  the ring entirely was never an option here, and on hardware where it is available the small-message
+  numbers could differ. Untested.
+- **The tokens/sec and TP-speedup figures are modelled**, not a re-run of vLLM under tensor
+  parallelism. They compose T6's measured error budget with a measured α, and the Amdahl model is
+  deliberately optimistic: it holds the non-weight 26% fixed under sharding, which T5 measured to be
+  false. Read them as upper bounds. Stage 3's numbers, by contrast, are measured — but on a single
+  layer, not an end-to-end serving stack.
+- **α is attributed to launch and synchronisation by inference, not by direct measurement.** The
+  evidence is that it is flat across world size (hops contribute 1.5%) and that NCCL uses one channel
+  at this size. An Nsight capture separating launch from in-kernel time would turn that inference
+  into an observation. This topic does not.
 - **One fabric.** NVLink on one node. The interesting contrast is PCIe, where α is several times
-  larger — the model predicts what that does to the decode case, but this topic will not have
-  measured it.
-- **gloo/CPU numbers are rehearsal and are never published.** Loopback has a different α and no
-  ring at all.
+  larger; the model predicts what that does to decode, but this topic has not measured it.
+- **Synthetic tensors**, as in T7 and T8 — the collective's cost depends on shape and fabric, not on
+  values.
 
 ## Reproduce
 
@@ -184,14 +235,35 @@ make t9-rehearse    # identical harness over gloo on CPU; numbers not published
 uv run pytest topics/t09_interconnects tests    # unit tests + distinctness, no GPU
 ```
 
-On a 4x A100 SXM NVLink pod, on-demand. `scripts/t9_session.sh` is the whole session; run `gate`
-on its own first, because it needs nothing but `nvidia-smi` and so decides whether the pod is
-worth keeping before anything has been downloaded onto it:
+On a 4× A100 SXM NVLink pod, on-demand. [`scripts/t9_session.sh`](../../scripts/t9_session.sh) is the
+whole session; run `gate` on its own first, since it needs nothing but `nvidia-smi` and so decides
+whether the pod is worth keeping before anything is downloaded onto it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/oscaralateras/inference-from-the-metal-up/main/scripts/t9_session.sh -o t9.sh
 bash t9.sh gate     # ~30s. If this fails, destroy the pod and re-rent.
-bash t9.sh setup    # clone + uv sync + make probe (~20 min)
-bash t9.sh run      # stages 1-2
-bash t9.sh tp       # stage 3
+bash t9.sh setup    # clone + uv sync + make probe
+bash t9.sh run      # stages 1-2: sweep, fit, decode operating points, plots
+bash t9.sh tp       # stage 3: the real layer, band (4)
 ```
+
+**Put the build on local disk, not `/workspace`.** RunPod mounts `/workspace` as network storage
+(MooseFS), which manages roughly 250 small-file creates per second; unpacking torch and vLLM writes
+well over 100,000 files, so the install stalls there while the network itself is idle at 197 MB/s.
+The script defaults to `/workspace` for persistence — override it, and point uv's cache there too:
+
+```bash
+export UV_CACHE_DIR=/root/.cache/uv
+WORKDIR=/root/ifmu bash t9.sh setup
+```
+
+The NCCL algorithm capture behind band 1:
+
+```bash
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=TUNING \
+  uv run python -m topics.t09_interconnects.measure --backend nccl --world-sizes 4 \
+  2>&1 | grep -E "AllReduce:.*Algo"
+```
+
+Every number quoted in this note is asserted against `results/interconnect.csv` by
+`test_lab_note_matches_results` in `test_t09.py`, so the prose cannot drift from the data.

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+from arch_common.results_io import read_rows, scalar, select
 from topics.t09_interconnects.model import (
     DEFAULT_HIDDEN,
     RingCost,
@@ -346,3 +347,157 @@ def test_nic_rows_and_columns_are_ignored() -> None:
     topo = parse_topo(REAL_POD_MATRIX)
 
     assert set(topo.matrix.values()) == {"NV12"}
+
+
+# ---------------------------------------------------------------------------------------------
+# The lab note, checked against the data it claims to describe
+# ---------------------------------------------------------------------------------------------
+#
+# T5 learned this the hard way: its note and its CSV disagreed until a test compared them. A number
+# in prose is a copy of a number in a file, and copies drift -- especially when a topic is re-run on
+# new hardware and only some of the paragraphs get updated. Every figure quoted in README.md is
+# listed here with its provenance, so a re-run that changes the data fails the build rather than
+# quietly leaving the note describing a machine nobody has now.
+
+
+def _results() -> list[dict[str, str]]:
+    from topics.t09_interconnects.measure import CSV_PATH
+
+    if not CSV_PATH.exists():
+        pytest.skip("T9 has not been run in this session")
+    return read_rows(CSV_PATH)
+
+
+def _fit(rows: list[dict[str, str]], world: int, metric: str) -> float:
+    return scalar(rows, "fit", f"world{world}", metric)
+
+
+def _at(rows: list[dict[str, str]], experiment: str, world: int, metric: str, batch: int) -> float:
+    hits = [v for x, v in select(rows, experiment, f"world{world}", metric) if int(x) == batch]
+    assert len(hits) == 1, f"expected one {experiment}/world{world}/{metric} at batch {batch}"
+    return hits[0]
+
+
+# (world, metric, value quoted in README.md, relative tolerance)
+QUOTED_FIT = [
+    (2, "alpha_us", 35.45, 0.01),
+    (4, "alpha_us", 35.80, 0.01),
+    (2, "beta_gbps", 201.5, 0.01),
+    (4, "beta_gbps", 221.7, 0.01),
+    (2, "fit_r_squared", 0.9997, 0.001),
+    (4, "fit_r_squared", 0.9999, 0.001),
+]
+
+# (world, batch, comms us/token, modelled TP speedup) — the tensor-parallelism table.
+QUOTED_TP = [
+    (2, 1, 1987, 1.23),
+    (2, 8, 250, 1.53),
+    (2, 32, 64, 1.57),
+    (2, 128, 17.5, 1.58),
+    (4, 1, 2008, 1.59),
+    (4, 8, 253, 2.13),
+    (4, 32, 65, 2.21),
+    (4, 128, 18.4, 2.23),
+]
+
+# (world, batch, measured speedup, comms share) — stage 3's real layer.
+QUOTED_MEASURED = [
+    (2, 1, 1.36, 0.278),
+    (2, 128, 1.22, 0.286),
+    (4, 1, 1.49, 0.582),
+    (4, 128, 1.54, 0.476),
+]
+
+
+@pytest.mark.parametrize(("world", "metric", "quoted", "rel"), QUOTED_FIT)
+def test_lab_note_matches_results(world: int, metric: str, quoted: float, rel: float) -> None:
+    assert _fit(_results(), world, metric) == pytest.approx(quoted, rel=rel)
+
+
+@pytest.mark.parametrize(("world", "batch", "comms_us", "speedup"), QUOTED_TP)
+def test_lab_note_tp_table_matches_results(
+    world: int, batch: int, comms_us: float, speedup: float
+) -> None:
+    rows = _results()
+    assert _at(rows, "decode", world, "comms_us_per_token", batch) == pytest.approx(
+        comms_us, rel=0.01
+    )
+    assert _at(rows, "decode", world, "tp_speedup", batch) == pytest.approx(speedup, rel=0.01)
+
+
+@pytest.mark.parametrize(("world", "batch", "speedup", "share"), QUOTED_MEASURED)
+def test_lab_note_measured_layer_matches_results(
+    world: int, batch: int, speedup: float, share: float
+) -> None:
+    rows = _results()
+    assert _at(rows, "tp_matmul", world, "tp_speedup", batch) == pytest.approx(speedup, rel=0.01)
+    assert _at(rows, "tp_matmul", world, "comms_share", batch) == pytest.approx(share, rel=0.01)
+
+
+def test_lab_note_headline_alpha_ratio() -> None:
+    """Band 1's verdict: alpha did not scale with 2(N-1). The note quotes 1.01."""
+    rows = _results()
+    ratio = _fit(rows, 4, "alpha_us") / _fit(rows, 2, "alpha_us")
+    assert ratio == pytest.approx(1.01, abs=0.01)
+
+
+def test_lab_note_alpha_floor_and_hop_decomposition() -> None:
+    """The note solves alpha = L + 2(N-1)h and quotes L = 35.28 us, h = 0.087 us, hops = 1.5%."""
+    rows = _results()
+    a2, a4 = _fit(rows, 2, "alpha_us"), _fit(rows, 4, "alpha_us")
+    hop = (a4 - a2) / (ring_hops(4) - ring_hops(2))
+    floor = a2 - ring_hops(2) * hop
+
+    assert floor == pytest.approx(35.28, abs=0.05)
+    assert hop == pytest.approx(0.087, abs=0.005)
+    assert ring_hops(4) * hop / a4 == pytest.approx(0.015, abs=0.002)
+
+
+def test_lab_note_decode_is_a_rounding_error_of_the_link() -> None:
+    """The note quotes 0.300 GB/s at batch 1 on 4 GPUs — 0.135% of the fitted beta."""
+    rows = _results()
+    call_us = _at(rows, "decode", 4, "allreduce_us", 1)
+    achieved = bus_gbps(allreduce_bytes(1, DEFAULT_HIDDEN), 4, call_us)
+
+    assert achieved == pytest.approx(0.300, abs=0.005)
+    assert achieved / _fit(rows, 4, "beta_gbps") == pytest.approx(0.00135, abs=0.0001)
+
+
+def test_lab_note_decode_tax_against_t6() -> None:
+    """The note quotes 2.01 ms of collectives per token = 18.2% of T6's measured step."""
+    from topics.t09_interconnects.predict import t6_budget
+
+    _, _, step_ms = t6_budget()
+    comms_ms = _at(_results(), "decode", 4, "comms_us_per_token", 1) / 1000.0
+
+    assert comms_ms == pytest.approx(2.01, abs=0.02)
+    assert comms_ms / step_ms == pytest.approx(0.182, abs=0.002)
+
+
+def test_lab_note_band_verdicts_are_reported_correctly() -> None:
+    """Three of six outside — a note quietly reporting five WITHIN passes every other test."""
+    from topics.t09_interconnects.predict import (
+        MIN_DECODE_ALPHA_SHARE,
+        MIN_SHARE_OF_LINK_SPEC,
+        NVLINK_GBPS_PER_LINK,
+    )
+
+    rows = _results()
+    nv12_spec = 12 * NVLINK_GBPS_PER_LINK
+
+    # Band 2: fails at world 2, passes at world 4 — exactly as the note's table says.
+    assert _fit(rows, 2, "beta_gbps") / nv12_spec < MIN_SHARE_OF_LINK_SPEC
+    assert _fit(rows, 4, "beta_gbps") / nv12_spec >= MIN_SHARE_OF_LINK_SPEC
+
+    # Band 3: passes at both.
+    for world in (2, 4):
+        assert _at(rows, "decode", world, "alpha_share", 1) >= MIN_DECODE_ALPHA_SHARE
+
+    # Band 4: passes at world 4, fails at world 2.
+    for world, expected_pass in ((4, True), (2, False)):
+        ratios = [
+            v for _, v in select(rows, "tp_model_check", f"world{world}", "measured_over_predicted")
+        ]
+        assert ratios, f"no tp_model_check rows for world {world}"
+        within = all(1 / 1.5 <= r <= 1.5 for r in ratios)
+        assert within is expected_pass

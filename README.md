@@ -26,11 +26,11 @@ compute moves it. Batching is what escapes the wall.*
 | [T6](topics/t06_perf_reasoning) | Performance reasoning | A 7B decodes at **90.5 tok/s** on an A100 and **74% of every step is reading weights**; the KV cache is 0.2%. Effective decode bandwidth is **1,283 GB/s = 74%** of a streaming copy. CUDA graphs are worth **15–36%** of the step, and the loss *grows* with batch. One band failed on re-run (residual 26.1% against ≤25%) and is reported as failed. | `0.74 × bandwidth / bytes_per_token` predicts decode within 36%. Batch to ~32–64, not to memory: batch 256 buys 55% more throughput for 170% more tail latency. |
 | [T7](topics/t07_roofline) | Roofline model & arithmetic intensity | Decode runs at **0.5%** of an A100's compute — and that is near-optimal, not wasteful: it hits **82%** of the *memory* roof it is actually under. Batching walks it from 1 to 236 FLOPs/byte, **×103 throughput to batch 128**, then **×1.04** to 256 once it crosses the ridge at 150. | Decode is memory-bound by two orders of magnitude, so quantisation (which raises intensity) beats buying FLOP/s. Batch until the ridge; the ceiling is knowable before you run anything. |
 | [T8](topics/t08_gpu_architecture) | GPU architecture: what quantisation costs | A fused int4 GEMV in Triton cuts the bytes **3.88×** and buys **1.54×** against the same kernel in bf16 — which itself reaches **95.5%** of the memory roof, ahead of cuBLAS's 83.2%. Two of three pre-registered bands failed. An int8 control run through the same harness **passes** the band it fails (75.7% of its byte ratio vs 39.8%). | Quantisation does not remove work, it **trades memory traffic for arithmetic**: 4× fewer bytes costs ~4× more work per byte, against an A100's ~11.2 fp32 FLOPs per byte of measured bandwidth. Normalised to weights rather than bytes, int4 and int8 sit within 3.6% of each other (1,281 vs 1,237 Gweights/s) while their bandwidths differ by 1.9× — below bf16 the limit stops being bytes and becomes work per weight. This is the term Marlin and AWQ are built to attack. |
+| [T9](topics/t09_interconnects) | Interconnects & multi-device | A decode all-reduce is **99.9% fixed cost**: 35.85 µs to move 7 KB, achieving **0.135%** of the bandwidth the same NVLink delivers to a large message. The fixed cost **did not scale with world size** (35.45 → 35.80 µs across 2 → 4 GPUs, against a predicted 3×) — NCCL runs decode-sized messages on **1 of 24 channels**, so hops are 1.5% of it. Three of six pre-registered bands failed. | 56 collectives per token cost **2.01 ms = 18.2%** of T6's step, so measured TP on a real layer buys **1.36× on 2 GPUs and 1.49× on 4**, not 2× and 4×. Sharding wider is nearly free in latency terms; batching is what pays for the collectives (17.5 µs/token at batch 128). Shard for capacity, not for low-batch latency. |
 
 ## Roadmap
 
-Eleven topics, built in order. Eight shipped; T9's harness is written, tested and its bands
-registered, awaiting one multi-GPU session; T10 and T11 are scoped and planned.
+Eleven topics, built in order. Nine shipped; T10 and T11 are scoped and planned.
 
 | | Topic | Language | Status |
 |---|---|---|---|
@@ -42,7 +42,7 @@ registered, awaiting one multi-GPU session; T10 and T11 are scoped and planned.
 | T6 | Performance reasoning | Python · GPU | ✅ shipped |
 | T7 | Roofline model & arithmetic intensity | Python · GPU | ✅ shipped |
 | T8 | GPU architecture: fused int4 GEMV | Triton · GPU | ✅ shipped |
-| T9 | Interconnects & multi-device | Python · multi-GPU | 🔧 [harness ready](topics/t09_interconnects), bands registered |
+| T9 | Interconnects & multi-device | Python · 4× GPU | ✅ shipped |
 | T10 | OS & virtual memory | C + Python | planned |
 | T11 | Compiler / runtime layer | Python · GPU | planned |
 
@@ -52,8 +52,9 @@ The numbers are only worth reading if the method is honest, so:
 
 - **Author on the Mac; measure on real hardware.** Canonical CPU numbers come from an **AMD
   EPYC-Milan** box (Hetzner CCX33, Ubuntu 24.04, 64-byte cache line); GPU results from a T4 (T3),
-  **4× A100 SXM on NV12 NVLink** (T5), and a single **A100-SXM4-80GB** for T6, T7 and T8, which
-  share one measurement session so their numbers compose. `rdtsc`, cache sizes,
+  **4× A100 SXM on NV12 NVLink** (T5 and T9), and a single **A100-SXM4-80GB** for T6, T7 and T8, which
+  share one measurement session so their numbers compose. T9 ran on a 4× A100 node measuring
+  1,739 GB/s against those three's 1,737, so it composes with them too. `rdtsc`, cache sizes,
   cache-line width and branch-prediction behaviour all differ on Apple Silicon, which would make the
   numbers non-canonical. Every lab note states the hardware it ran on.
 - **Use the language that tells the truth.** C and Rust where cycle-level effects matter (T2–T4) —

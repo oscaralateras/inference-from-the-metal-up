@@ -57,7 +57,7 @@ def plot_cost_curve(rows: list[dict[str, str]]) -> None:
     fig, ax = plt.subplots(figsize=(10, 6.5))
     colours = {2: "#1f77b4", 4: "#d62728"}
 
-    for world in _worlds(rows):
+    for i, world in enumerate(_worlds(rows)):
         points = select(rows, "sweep", f"world{world}", "allreduce_us")
         if not points:
             continue
@@ -70,10 +70,13 @@ def plot_cost_curve(rows: list[dict[str, str]]) -> None:
         model = [fit.time_us(int(n)) for n, _ in points]
         ax.plot(xs, model, "-", lw=1.3, color=colour, alpha=0.75)
         ax.axhline(fit.alpha_us, color=colour, ls=":", lw=1, alpha=0.6)
+        # The two floors are ~0.35 us apart out of ~35, so their labels land on top of each other
+        # and one of them wins. Stagger vertically by series index. That the labels *want* to
+        # collide is the finding, so the figure should still show both values.
         ax.annotate(
-            f"α = {fit.alpha_us:.1f} µs",
+            f"α = {fit.alpha_us:.2f} µs ({world} GPUs)",
             xy=(xs[0], fit.alpha_us),
-            xytext=(4, 5),
+            xytext=(4, 6 + 12 * i),
             textcoords="offset points",
             color=colour,
             fontsize=9,
@@ -157,36 +160,57 @@ def plot_bus_bandwidth(rows: list[dict[str, str]]) -> None:
 
 
 def plot_decode_tax(rows: list[dict[str, str]]) -> None:
-    """Predicted TP speedup vs batch — the decision the topic exists to inform."""
+    """Modelled TP speedup vs batch, with stage 3's measured points over it.
+
+    The two series are **not the same quantity** and the figure says so rather than letting the
+    reader assume: the lines are a modelled whole decode step (T6's error budget with a measured
+    alpha), the crosses are one measured row-parallel layer. Drawn together because the comparison
+    is the point of stage 3, coloured by world size because an undifferentiated marker put TP4's
+    measured 1.49x below TP2's modelled line, which reads as a contradiction rather than as two
+    different things being measured.
+    """
     fig, ax = plt.subplots(figsize=(10, 5.5))
+    colours = {2: "#1f77b4", 4: "#ff7f0e"}
+
     for world in _worlds(rows):
         points = select(rows, "decode", f"world{world}", "tp_speedup")
         if not points:
             continue
-        ax.plot([b for b, _ in points], [v for _, v in points], "o-", ms=5, label=f"TP{world}")
-        ax.axhline(world, ls=":", lw=1, alpha=0.4)
-
-    measured = [
-        (b, v)
-        for world in _worlds(rows)
-        for b, v in select(rows, "tp_matmul", f"world{world}", "tp_speedup")
-    ]
-    if measured:
+        colour = colours.get(world, "#555555")
         ax.plot(
-            [b for b, _ in measured],
-            [v for _, v in measured],
-            "x",
-            ms=8,
-            color="k",
-            label="measured (TP matmul)",
+            [b for b, _ in points],
+            [v for _, v in points],
+            "o-",
+            ms=5,
+            color=colour,
+            label=f"TP{world} — modelled, whole step",
         )
+        ax.axhline(world, ls=":", lw=1, alpha=0.4, color=colour)
+
+        measured = select(rows, "tp_matmul", f"world{world}", "tp_speedup")
+        if measured:
+            ax.plot(
+                [b for b, _ in measured],
+                [v for _, v in measured],
+                "X",
+                ms=10,
+                color=colour,
+                markeredgecolor="k",
+                markeredgewidth=0.6,
+                linestyle="none",
+                label=f"TP{world} — measured, one layer",
+            )
 
     ax.set_xscale("log", base=2)
     ax.set_xlabel("decode batch size")
     ax.set_ylabel("speedup vs 1 GPU")
-    ax.set_title("Sharding buys least exactly where latency matters most", fontsize=11)
+    ax.set_title(
+        "Sharding buys least exactly where latency matters most\n"
+        "lines: modelled whole step   crosses: one measured row-parallel layer",
+        fontsize=11,
+    )
     ax.grid(alpha=0.25)
-    ax.legend()
+    ax.legend(fontsize=9)
     fig.tight_layout()
     fig.savefig(RESULTS_DIR / "decode_tax.png", dpi=150)
     plt.close(fig)
