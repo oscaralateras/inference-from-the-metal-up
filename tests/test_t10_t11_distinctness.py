@@ -175,11 +175,16 @@ def test_this_session_agrees_with_the_one_t6_and_t7_were_measured_on() -> None:
     and as a share of the roof it was scored against, and a value over its own fraction recovers
     the denominator. Derived from committed measurements rather than typed in.
     """
-    from arch_common.gpu import load_profile
+    from arch_common.gpu import PROFILE_PATH, load_profile
     from topics.t08_gpu_architecture.measure import CSV_PATH as T8_CSV
 
     if not T8_CSV.exists():
         pytest.skip("T8 has not been run")
+    if not PROFILE_PATH.exists():
+        # The probe is machine-local and gitignored, so a fresh clone has no session to compare.
+        # Skipping keeps the suite green off a clean checkout; on a pod the probe exists and this
+        # test does its job.
+        pytest.skip("no hardware probe in this checkout — run `make probe` on the target machine")
 
     rows = read_rows(T8_CSV)
     achieved = scalar(rows, "ceiling", "load_only", "gbps")
