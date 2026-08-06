@@ -78,15 +78,23 @@ setup() {
   make probe
 }
 
-run()  { cd "$WORKDIR"; export PATH="$HOME/.local/bin:$PATH"; say "stages 1-2"; make t9; }
-tp()   { cd "$WORKDIR"; export PATH="$HOME/.local/bin:$PATH"; say "stage 3";    make t9-tp; }
+run()    { cd "$WORKDIR"; export PATH="$HOME/.local/bin:$PATH"; say "stages 1-2"; make t9; }
+tp()     { cd "$WORKDIR"; export PATH="$HOME/.local/bin:$PATH"; say "stage 3";   make t9-tp; }
+launch() { cd "$WORKDIR"; export PATH="$HOME/.local/bin:$PATH"; say "what is alpha made of";
+           make t9-launch; }
+# Stage 4 is by far the longest: one vLLM engine spawn per TP size, plus the model download on the
+# first one. Run it last, so a failure here costs nothing that has not already been written.
+vllm()   { cd "$WORKDIR"; export PATH="$HOME/.local/bin:$PATH"; say "stage 4 (~25 min)";
+           make t9-vllm; }
 
 case "${1:-all}" in
-  gate)  gate ;;
-  setup) gate; setup ;;
-  run)   run ;;
-  tp)    tp ;;
-  all)   gate; setup; run; tp
-         say "DONE — commit results, then DESTROY THE POD. Idle time is the only real cost." ;;
-  *)     die "unknown subcommand '${1}'. Use: gate | setup | run | tp | all" ;;
+  gate)   gate ;;
+  setup)  gate; setup ;;
+  run)    run ;;
+  tp)     tp ;;
+  launch) launch ;;
+  vllm)   vllm ;;
+  all)    gate; setup; run; tp; launch; vllm
+          say "DONE — commit results, then DESTROY THE POD. Idle time is the only real cost." ;;
+  *)      die "unknown subcommand '${1}'. Use: gate | setup | run | tp | launch | vllm | all" ;;
 esac

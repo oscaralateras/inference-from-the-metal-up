@@ -160,14 +160,18 @@ def plot_bus_bandwidth(rows: list[dict[str, str]]) -> None:
 
 
 def plot_decode_tax(rows: list[dict[str, str]]) -> None:
-    """Modelled TP speedup vs batch, with stage 3's measured points over it.
+    """Modelled TP speedup vs batch, with both sets of measured points over it.
 
-    The two series are **not the same quantity** and the figure says so rather than letting the
+    The three series are **not the same quantity** and the figure says so rather than letting the
     reader assume: the lines are a modelled whole decode step (T6's error budget with a measured
-    alpha), the crosses are one measured row-parallel layer. Drawn together because the comparison
-    is the point of stage 3, coloured by world size because an undifferentiated marker put TP4's
-    measured 1.49x below TP2's modelled line, which reads as a contradiction rather than as two
-    different things being measured.
+    alpha), the crosses are one measured row-parallel layer, and the stars are vLLM serving the
+    whole model. Only the stars and the lines are comparable like for like, and the stars sit
+    *above* the lines — the model is an upper bound on a naive collective, not on a real engine,
+    which ships a custom all-reduce and captures the step as a CUDA graph.
+
+    Coloured by world size because an undifferentiated marker put TP4's measured single-layer
+    point below TP2's modelled line, which reads as a contradiction rather than as two different
+    things being measured.
     """
     fig, ax = plt.subplots(figsize=(10, 5.5))
     colours = {2: "#1f77b4", 4: "#ff7f0e"}
@@ -201,12 +205,29 @@ def plot_decode_tax(rows: list[dict[str, str]]) -> None:
                 label=f"TP{world} — measured, one layer",
             )
 
+        # vLLM end to end: the only series here that is a whole serving stack rather than a model
+        # or a single layer, and the one that beats the model — because it does not pay NCCL's α.
+        engine = select(rows, "vllm_tp", f"tp{world}", "measured_speedup")
+        if engine and world > 1:
+            ax.plot(
+                [b for b, _ in engine],
+                [v for _, v in engine],
+                "*",
+                ms=15,
+                color=colour,
+                markeredgecolor="k",
+                markeredgewidth=0.6,
+                linestyle="none",
+                label=f"TP{world} — measured, vLLM end to end",
+            )
+
     ax.set_xscale("log", base=2)
     ax.set_xlabel("decode batch size")
     ax.set_ylabel("speedup vs 1 GPU")
     ax.set_title(
         "Sharding buys least exactly where latency matters most\n"
-        "lines: modelled whole step   crosses: one measured row-parallel layer",
+        "lines: modelled whole step   crosses: one measured row-parallel layer   "
+        "stars: vLLM end to end",
         fontsize=11,
     )
     ax.grid(alpha=0.25)
@@ -216,13 +237,81 @@ def plot_decode_tax(rows: list[dict[str, str]]) -> None:
     plt.close(fig)
 
 
+def plot_launch_amortisation(rows: list[dict[str, str]]) -> bool:
+    """Per-call cost against how many collectives share one timed window.
+
+    This is the figure that settles what α is made of. Host-side dispatch is paid once per call on
+    the CPU and overlaps with the device executing the previous call, so batching launches hides
+    all but the first one's: if α were launch overhead the curve would fall to nothing. It falls,
+    then flattens well above zero, and the height of that plateau is the device-side cost.
+    """
+
+    def _key(variant: str) -> tuple[int, int]:
+        world, batch = variant.removeprefix("world").split("_b")
+        return int(world), int(batch)
+
+    variants = sorted(
+        {
+            r["variant"]
+            for r in rows
+            if r["experiment"] == "launch_amortisation" and r["variant"].startswith("world")
+        },
+        key=_key,
+    )
+    if not variants:
+        return False
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    colours = {2: "#1f77b4", 4: "#d62728"}
+    styles = {1: "-", 8: "--", 32: ":"}
+
+    for variant in variants:
+        world, batch = _key(variant)
+        points = select(rows, "launch_amortisation", variant, "percall_us")
+        if not points:
+            continue
+        ax.plot(
+            [n for n, _ in points],
+            [v for _, v in points],
+            marker="o",
+            ms=4,
+            color=colours.get(world, "#555555"),
+            ls=styles.get(batch, "-"),
+            label=f"{world} GPUs, batch {batch}",
+        )
+
+    for world in _worlds(rows):
+        try:
+            alpha = _fit(rows, world).alpha_us
+        except KeyError:
+            continue
+        ax.axhline(alpha, color=colours.get(world, "#555555"), lw=1, alpha=0.4)
+
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("collectives sharing one timed window")
+    ax.set_ylabel("cost per call (µs)")
+    ax.set_ylim(bottom=0)
+    ax.set_title(
+        "Batching the launches does not make the cost go away\n"
+        "horizontal lines: α as fitted by the size sweep, which already times 16 calls per window",
+        fontsize=11,
+    )
+    ax.grid(alpha=0.25, which="both")
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    fig.savefig(RESULTS_DIR / "launch_amortisation.png", dpi=150)
+    plt.close(fig)
+    return True
+
+
 def _main() -> None:
     rows = read_rows(CSV_PATH)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     plot_cost_curve(rows)
     plot_bus_bandwidth(rows)
     plot_decode_tax(rows)
-    print(f"wrote 3 figures -> {RESULTS_DIR}")
+    written = 3 + int(plot_launch_amortisation(rows))
+    print(f"wrote {written} figures -> {RESULTS_DIR}")
 
 
 if __name__ == "__main__":

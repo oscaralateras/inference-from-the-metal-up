@@ -16,6 +16,14 @@ ahead of the device. If alpha is device-side — protocol synchronisation, flag 
 protocol's own handshake — then batching the launches changes nothing at all, because each call
 still has to happen on the GPU in sequence.
 
+**What the sweep can and cannot conclude.** The load-bearing half is the *plateau*: a per-call cost
+that survives having every launch batched is not launch cost, and its height is what `measure.py`
+reports as alpha. The *descent* is weaker evidence than it looks. Timing records CUDA events on the
+stream, so at inner=1 each event pair brackets a collective that has just re-synchronised with its
+peers across an unmeasured host-side gap, while at inner=64 the ranks are already in lockstep. Host
+dispatch and rank skew both shrink under batching and this measurement cannot separate them. The
+conclusion is drawn from where the curve stops falling, not from how far it fell.
+
 This reframed the topic's own headline mid-flight, and the reason is worth recording. `measure.py`
 already times with 16 back-to-back calls per window, so the alpha it reports is **already** an
 amortised-launch number. Host dispatch had therefore already been ruled out before this module was

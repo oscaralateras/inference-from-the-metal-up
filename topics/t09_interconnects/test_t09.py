@@ -373,41 +373,83 @@ def _fit(rows: list[dict[str, str]], world: int, metric: str) -> float:
     return scalar(rows, "fit", f"world{world}", metric)
 
 
-def _at(rows: list[dict[str, str]], experiment: str, world: int, metric: str, batch: int) -> float:
-    hits = [v for x, v in select(rows, experiment, f"world{world}", metric) if int(x) == batch]
-    assert len(hits) == 1, f"expected one {experiment}/world{world}/{metric} at batch {batch}"
+def _at(
+    rows: list[dict[str, str]],
+    experiment: str,
+    world: int,
+    metric: str,
+    batch: int,
+    prefix: str = "world",
+) -> float:
+    variant = f"{prefix}{world}"
+    hits = [v for x, v in select(rows, experiment, variant, metric) if int(x) == batch]
+    assert len(hits) == 1, f"expected one {experiment}/{variant}/{metric} at batch {batch}"
     return hits[0]
 
 
 # (world, metric, value quoted in README.md, relative tolerance)
 QUOTED_FIT = [
-    (2, "alpha_us", 35.45, 0.01),
-    (4, "alpha_us", 35.80, 0.01),
-    (2, "beta_gbps", 201.5, 0.01),
-    (4, "beta_gbps", 221.7, 0.01),
+    (2, "alpha_us", 33.95, 0.01),
+    (3, "alpha_us", 32.73, 0.01),
+    (4, "alpha_us", 34.49, 0.01),
+    (2, "beta_gbps", 202.6, 0.01),
+    (3, "beta_gbps", 214.5, 0.01),
+    (4, "beta_gbps", 221.8, 0.01),
     (2, "fit_r_squared", 0.9997, 0.001),
+    (3, "fit_r_squared", 0.9997, 0.001),
     (4, "fit_r_squared", 0.9999, 0.001),
+    (2, "alpha_us_min", 32.52, 0.01),
+    (2, "alpha_us_max", 34.85, 0.01),
+    (3, "alpha_us_min", 32.63, 0.01),
+    (3, "alpha_us_max", 37.50, 0.01),
+    (4, "alpha_us_min", 33.80, 0.01),
+    (4, "alpha_us_max", 36.00, 0.01),
 ]
 
 # (world, batch, comms us/token, modelled TP speedup) — the tensor-parallelism table.
 QUOTED_TP = [
-    (2, 1, 1987, 1.23),
-    (2, 8, 250, 1.53),
-    (2, 32, 64, 1.57),
-    (2, 128, 17.5, 1.58),
-    (4, 1, 2008, 1.59),
-    (4, 8, 253, 2.13),
-    (4, 32, 65, 2.21),
-    (4, 128, 18.4, 2.23),
+    (2, 1, 1903, 1.24),
+    (2, 8, 240, 1.53),
+    (2, 32, 61, 1.57),
+    (2, 128, 16.8, 1.58),
+    (4, 1, 1934, 1.61),
+    (4, 8, 244, 2.13),
+    (4, 32, 63, 2.21),
+    (4, 128, 17.8, 2.23),
 ]
 
-# (world, batch, measured speedup, comms share) — stage 3's real layer.
-QUOTED_MEASURED = [
-    (2, 1, 1.36, 0.278),
-    (2, 128, 1.22, 0.286),
-    (4, 1, 1.49, 0.582),
-    (4, 128, 1.54, 0.476),
+# (world, batch, matmul us, comms in situ us, comms alone us, overlap ratio, comms share) —
+# stage 3's real layer, including the in-process control that resolved band 4's world-2 anomaly.
+QUOTED_LAYER = [
+    (2, 1, 51.6, 22.3, 35.4, 1.59, 0.302),
+    (2, 8, 68.3, 16.8, 33.2, 1.98, 0.199),
+    (2, 32, 57.3, 18.9, 34.8, 1.84, 0.249),
+    (2, 128, 66.0, 25.7, 35.2, 1.37, 0.281),
+    (4, 1, 27.5, 38.1, 36.0, 0.95, 0.584),
+    (4, 8, 35.0, 35.5, 33.5, 0.94, 0.507),
+    (4, 32, 36.8, 36.4, 33.9, 0.93, 0.526),
+    (4, 128, 38.4, 33.7, 35.0, 1.04, 0.470),
 ]
+
+# (tp, batch, step ms, tokens/sec, measured speedup or 0, modelled speedup or 0) — stage 4.
+QUOTED_VLLM = [
+    (1, 1, 11.12, 89.9, 0.0, 0.0),
+    (1, 8, 14.65, 546.1, 0.0, 0.0),
+    (1, 32, 24.70, 1295.5, 0.0, 0.0),
+    (2, 1, 7.22, 138.5, 1.54, 1.25),
+    (2, 8, 9.99, 800.8, 1.47, 1.54),
+    (2, 32, 15.06, 2125.5, 1.64, 1.58),
+    (4, 1, 4.99, 200.5, 2.23, 1.61),
+    (4, 8, 6.27, 1275.4, 2.34, 2.16),
+    (4, 32, 10.12, 3162.0, 2.44, 2.22),
+]
+
+# (world, per-call us at 1, 2, 4, 8, 16, 32, 64 calls per timed window) — the amortisation sweep
+# at decode batch 1, which is the evidence that alpha is device-side rather than host launch.
+QUOTED_AMORTISATION = {
+    2: [60.83, 45.97, 44.30, 39.74, 37.20, 35.80, 34.81],
+    4: [72.13, 52.82, 42.68, 37.99, 35.82, 34.34, 32.03],
+}
 
 
 @pytest.mark.parametrize(("world", "metric", "quoted", "rel"), QUOTED_FIT)
@@ -426,57 +468,153 @@ def test_lab_note_tp_table_matches_results(
     assert _at(rows, "decode", world, "tp_speedup", batch) == pytest.approx(speedup, rel=0.01)
 
 
-@pytest.mark.parametrize(("world", "batch", "speedup", "share"), QUOTED_MEASURED)
+@pytest.mark.parametrize(
+    ("world", "batch", "matmul", "comms", "alone", "overlap", "share"), QUOTED_LAYER
+)
 def test_lab_note_measured_layer_matches_results(
-    world: int, batch: int, speedup: float, share: float
+    world: int, batch: int, matmul: float, comms: float, alone: float, overlap: float, share: float
 ) -> None:
     rows = _results()
-    assert _at(rows, "tp_matmul", world, "tp_speedup", batch) == pytest.approx(speedup, rel=0.01)
-    assert _at(rows, "tp_matmul", world, "comms_share", batch) == pytest.approx(share, rel=0.01)
+    for metric, quoted in (
+        ("matmul_us", matmul),
+        ("comms_us", comms),
+        ("alone_us", alone),
+        ("overlap_ratio", overlap),
+        ("comms_share", share),
+    ):
+        assert _at(rows, "tp_matmul", world, metric, batch) == pytest.approx(quoted, rel=0.01), (
+            f"{metric} at world {world} batch {batch}"
+        )
+
+
+@pytest.mark.parametrize(("tp", "batch", "step_ms", "tok_s", "measured", "modelled"), QUOTED_VLLM)
+def test_lab_note_vllm_table_matches_results(
+    tp: int, batch: int, step_ms: float, tok_s: float, measured: float, modelled: float
+) -> None:
+    rows = _results()
+    assert _at(rows, "vllm_tp", tp, "step_ms", batch, prefix="tp") == pytest.approx(
+        step_ms, rel=0.01
+    )
+    assert _at(rows, "vllm_tp", tp, "tokens_per_sec", batch, prefix="tp") == pytest.approx(
+        tok_s, rel=0.01
+    )
+    if measured:
+        assert _at(rows, "vllm_tp", tp, "measured_speedup", batch, prefix="tp") == pytest.approx(
+            measured, rel=0.01
+        )
+        assert _at(rows, "vllm_tp", tp, "modelled_speedup", batch, prefix="tp") == pytest.approx(
+            modelled, rel=0.01
+        )
+
+
+def test_lab_note_vllm_reproduces_t6_single_gpu_step() -> None:
+    """The note claims TP1 batch 1 reproduces T6's step to within 0.6%, on a different pod.
+
+    This is the one number in the topic that has an independent prior measurement, so it is the
+    only available check that the whole differencing harness is measuring what T6 measured.
+    """
+    from topics.t09_interconnects.predict import t6_budget
+
+    _, _, t6_step_ms = t6_budget()
+    here = _at(_results(), "vllm_tp", 1, "step_ms", 1, prefix="tp")
+
+    assert abs(here - t6_step_ms) / t6_step_ms < 0.01
+
+
+@pytest.mark.parametrize("world", sorted(QUOTED_AMORTISATION))
+def test_lab_note_amortisation_curve_matches_results(world: int) -> None:
+    """The curve falls and then flattens *above zero* — that plateau is the note's whole claim."""
+    rows = _results()
+    points = {
+        int(x): v for x, v in select(rows, "launch_amortisation", f"world{world}_b1", "percall_us")
+    }
+    quoted = QUOTED_AMORTISATION[world]
+
+    for inner, value in zip((1, 2, 4, 8, 16, 32, 64), quoted, strict=True):
+        assert points[inner] == pytest.approx(value, rel=0.01), f"inner={inner}"
+
+    # It plateaus near the size sweep's alpha rather than near zero: host launch is not what alpha
+    # is made of. Generous bound because the two are separate processes and separate runs.
+    assert quoted[-1] == pytest.approx(_fit(rows, world, "alpha_us"), rel=0.10)
+
+
+def test_lab_note_amortisation_residue_is_stated_as_a_bound() -> None:
+    """The note quotes 6.9% (world 2) and 11.8% (world 4) between inner=16 and inner=64.
+
+    Stated as an upper bound on residual host dispatch in the headline alpha, which is timed at
+    inner=16. The curve has not converged at 64, so it cannot be quoted as a residue.
+    """
+    residues = {world: q[4] / q[6] - 1 for world, q in QUOTED_AMORTISATION.items()}
+
+    assert residues[2] == pytest.approx(0.069, abs=0.002)
+    assert residues[4] == pytest.approx(0.118, abs=0.002)
 
 
 def test_lab_note_headline_alpha_ratio() -> None:
-    """Band 1's verdict: alpha did not scale with 2(N-1). The note quotes 1.01."""
+    """Band 1's verdict: alpha did not scale with 2(N-1). The note quotes 1.02."""
     rows = _results()
     ratio = _fit(rows, 4, "alpha_us") / _fit(rows, 2, "alpha_us")
-    assert ratio == pytest.approx(1.01, abs=0.01)
+    assert ratio == pytest.approx(1.02, abs=0.01)
 
 
 def test_lab_note_alpha_floor_and_hop_decomposition() -> None:
-    """The note solves alpha = L + 2(N-1)h and quotes L = 35.28 us, h = 0.087 us, hops = 1.5%."""
-    rows = _results()
-    a2, a4 = _fit(rows, 2, "alpha_us"), _fit(rows, 4, "alpha_us")
-    hop = (a4 - a2) / (ring_hops(4) - ring_hops(2))
-    floor = a2 - ring_hops(2) * hop
+    """The note fits alpha = 33.19 us + 2(N-1) x 0.135 us with R^2 = 0.0895 over three worlds.
 
-    assert floor == pytest.approx(35.28, abs=0.05)
-    assert hop == pytest.approx(0.087, abs=0.005)
-    assert ring_hops(4) * hop / a4 == pytest.approx(0.015, abs=0.002)
+    Three world sizes rather than two is what makes this a fit with a residual instead of an exact
+    solve, and the residual is the point: the note's claim is that hop count explains ~9% of the
+    variation in alpha, which is only sayable because R^2 exists.
+    """
+    rows = _results()
+    budget = fit_latency_budget({w: _fit(rows, w, "alpha_us") for w in (2, 3, 4)})
+
+    assert budget.n_worlds == 3
+    assert budget.floor_us == pytest.approx(33.19, abs=0.05)
+    assert budget.hop_us == pytest.approx(0.135, abs=0.005)
+    assert budget.r_squared == pytest.approx(0.0895, abs=0.005)
+    assert budget.hop_share(4) == pytest.approx(0.0238, abs=0.002)
+
+
+def test_lab_note_repeat_spread_exceeds_world_size_spread() -> None:
+    """The note's strongest form of band 1: the noise is bigger than the effect.
+
+    This needs no model at all, which is why it is quoted alongside the fit — a reader who
+    distrusts a three-point regression can still read this one straight off the repeats.
+    """
+    rows = _results()
+    worlds = (2, 3, 4)
+
+    alphas = [_fit(rows, w, "alpha_us") for w in worlds]
+    across_worlds = max(alphas) - min(alphas)
+    within_world = [_fit(rows, w, "alpha_us_max") - _fit(rows, w, "alpha_us_min") for w in worlds]
+
+    assert across_worlds == pytest.approx(1.76, abs=0.02)
+    assert within_world == pytest.approx([2.33, 4.87, 2.19], abs=0.02)
+    assert min(within_world) > across_worlds
 
 
 def test_lab_note_decode_is_a_rounding_error_of_the_link() -> None:
-    """The note quotes 0.300 GB/s at batch 1 on 4 GPUs — 0.135% of the fitted beta."""
+    """The note quotes 0.311 GB/s at batch 1 on 4 GPUs — 0.14% of the fitted beta."""
     rows = _results()
     call_us = _at(rows, "decode", 4, "allreduce_us", 1)
     achieved = bus_gbps(allreduce_bytes(1, DEFAULT_HIDDEN), 4, call_us)
 
-    assert achieved == pytest.approx(0.300, abs=0.005)
-    assert achieved / _fit(rows, 4, "beta_gbps") == pytest.approx(0.00135, abs=0.0001)
+    assert achieved == pytest.approx(0.311, abs=0.005)
+    assert achieved / _fit(rows, 4, "beta_gbps") == pytest.approx(0.0014, abs=0.0001)
 
 
 def test_lab_note_decode_tax_against_t6() -> None:
-    """The note quotes 2.01 ms of collectives per token = 18.2% of T6's measured step."""
+    """The note quotes 1.93 ms of collectives per token = 17.5% of T6's measured step."""
     from topics.t09_interconnects.predict import t6_budget
 
     _, _, step_ms = t6_budget()
     comms_ms = _at(_results(), "decode", 4, "comms_us_per_token", 1) / 1000.0
 
-    assert comms_ms == pytest.approx(2.01, abs=0.02)
-    assert comms_ms / step_ms == pytest.approx(0.182, abs=0.002)
+    assert comms_ms == pytest.approx(1.93, abs=0.02)
+    assert comms_ms / step_ms == pytest.approx(0.175, abs=0.002)
 
 
 def test_lab_note_band_verdicts_are_reported_correctly() -> None:
-    """Three of six outside — a note quietly reporting five WITHIN passes every other test."""
+    """Three of seven outside — a note quietly reporting seven WITHIN passes every other test."""
     from topics.t09_interconnects.predict import (
         MIN_DECODE_ALPHA_SHARE,
         MIN_SHARE_OF_LINK_SPEC,
@@ -484,14 +622,17 @@ def test_lab_note_band_verdicts_are_reported_correctly() -> None:
     )
 
     rows = _results()
+    # Unidirectional, as the note states: 12 links x 25 GB/s each way. NVIDIA's marketed 600 GB/s
+    # is the bidirectional sum, and scoring beta against that would halve every share here.
     nv12_spec = 12 * NVLINK_GBPS_PER_LINK
 
-    # Band 2: fails at world 2, passes at world 4 — exactly as the note's table says.
+    # Band 2: fails at world 2, passes at worlds 3 and 4 — exactly as the note's table says.
     assert _fit(rows, 2, "beta_gbps") / nv12_spec < MIN_SHARE_OF_LINK_SPEC
-    assert _fit(rows, 4, "beta_gbps") / nv12_spec >= MIN_SHARE_OF_LINK_SPEC
+    for world in (3, 4):
+        assert _fit(rows, world, "beta_gbps") / nv12_spec >= MIN_SHARE_OF_LINK_SPEC
 
-    # Band 3: passes at both.
-    for world in (2, 4):
+    # Band 3: passes at every world size measured.
+    for world in (2, 3, 4):
         assert _at(rows, "decode", world, "alpha_share", 1) >= MIN_DECODE_ALPHA_SHARE
 
     # Band 4: passes at world 4, fails at world 2.
@@ -502,6 +643,33 @@ def test_lab_note_band_verdicts_are_reported_correctly() -> None:
         assert ratios, f"no tp_model_check rows for world {world}"
         within = all(1 / 1.5 <= r <= 1.5 for r in ratios)
         assert within is expected_pass
+
+
+def test_lab_note_overlap_control_kills_the_cross_process_explanation() -> None:
+    """Band 4's world-2 anomaly is overlap, and this is the measurement that says so.
+
+    Two explanations fitted the first session's data equally well: the collective overlaps the
+    matmul, or the isolated sweep is not comparable across processes. `alone_us` times the same
+    buffer in the same process as the layer, so if it reproduces the sweep's alpha the second
+    explanation is dead — and it does, at both world sizes.
+    """
+    rows = _results()
+
+    for world in (2, 4):
+        for batch in (1, 8, 32, 128):
+            alone = _at(rows, "tp_matmul", world, "alone_us", batch)
+            assert alone == pytest.approx(_fit(rows, world, "alpha_us"), rel=0.10), (
+                f"alone_us at world {world} batch {batch} does not reproduce the sweep's alpha"
+            )
+
+    # And the mechanism: overlap appears exactly where the matmul is long enough to hide behind.
+    for batch in (1, 8, 32, 128):
+        w2_room = _at(rows, "tp_matmul", 2, "matmul_us", batch) / _fit(rows, 2, "alpha_us")
+        w4_room = _at(rows, "tp_matmul", 4, "matmul_us", batch) / _fit(rows, 4, "alpha_us")
+        assert w2_room > 1.4, "world 2's matmul should be much longer than the collective"
+        assert w4_room < 1.2, "world 4's matmul should not be"
+        assert _at(rows, "tp_matmul", 2, "overlap_ratio", batch) > 1.3
+        assert _at(rows, "tp_matmul", 4, "overlap_ratio", batch) < 1.1
 
 
 # ---------------------------------------------------------------------------------------------

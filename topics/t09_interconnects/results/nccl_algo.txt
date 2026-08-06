@@ -1,25 +1,64 @@
 NCCL algorithm and protocol selection by message size.
 Captured with NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=TUNING on the 4x A100-SXM4-80GB
-NV12 node, NCCL 2.27.3, torch 2.8.0+cu128, session f3f296a657bc.
+NV12 node, NCCL 2.27.3, torch 2.8.0+cu128, session bdd8eeb753e5.
 
-This is the evidence behind band (1)'s failure. The ring IS used at every size --
-the algorithm was never the issue. What changes with size is the *protocol* and,
-decisively, the number of channels:
+This is the evidence behind band (1). The ring IS used at every size -- the
+algorithm was never the issue, which rules out the tree-algorithm explanation for
+alpha refusing to grow with world size. What changes with size is the *protocol*
+and the number of channels. Sorted by size below; the raw capture is unordered,
+since NCCL emits one line per tuning decision as the sweep walks the sizes:
 
-  AllReduce:         4 Bytes -> Algo RING proto LL     channel{Lo..Hi}={0..0}
-  AllReduce:     5,756 Bytes -> Algo RING proto LL     channel{Lo..Hi}={0..0}
-  AllReduce:   182,092 Bytes -> Algo RING proto LL     channel{Lo..Hi}={0..9}
-  AllReduce: 5,758,372 Bytes -> Algo RING proto LL128  channel{Lo..Hi}={0..23}
-  AllReduce: 182,095,808 Bytes -> Algo RING proto SIMPLE channel{Lo..Hi}={0..23}
+  AllReduce:             4 Bytes -> Algo RING proto LL     channel{0..0}
+  AllReduce:             8 Bytes -> Algo RING proto LL     channel{0..0}
+  AllReduce:         1,024 Bytes -> Algo RING proto LL     channel{0..0}
+  AllReduce:         1,820 Bytes -> Algo RING proto LL     channel{0..0}
+  AllReduce:         3,236 Bytes -> Algo RING proto LL     channel{0..0}
+  AllReduce:         5,756 Bytes -> Algo RING proto LL     channel{0..0}
+  AllReduce:        10,236 Bytes -> Algo RING proto LL     channel{0..0}
+  AllReduce:        18,208 Bytes -> Algo RING proto LL     channel{0..0}
+  AllReduce:        32,380 Bytes -> Algo RING proto LL     channel{0..0}
+  AllReduce:        57,580 Bytes -> Algo RING proto LL     channel{0..2}
+  AllReduce:       102,396 Bytes -> Algo RING proto LL     channel{0..5}
+  AllReduce:       182,092 Bytes -> Algo RING proto LL     channel{0..9}
+  AllReduce:       323,816 Bytes -> Algo RING proto LL     channel{0..17}
+  AllReduce:       575,836 Bytes -> Algo RING proto LL     channel{0..23}
+  AllReduce:     1,023,996 Bytes -> Algo RING proto LL     channel{0..23}
+  AllReduce:     1,820,956 Bytes -> Algo RING proto LL128  channel{0..22}
+  AllReduce:     3,238,172 Bytes -> Algo RING proto LL128  channel{0..23}
+  AllReduce:     5,758,372 Bytes -> Algo RING proto LL128  channel{0..23}
+  AllReduce:    10,239,996 Bytes -> Algo RING proto SIMPLE channel{0..23}
+  AllReduce:    18,209,580 Bytes -> Algo RING proto SIMPLE channel{0..23}
+  AllReduce:    32,381,720 Bytes -> Algo RING proto SIMPLE channel{0..23}
+  AllReduce:    57,583,748 Bytes -> Algo RING proto SIMPLE channel{0..23}
+  AllReduce:   102,399,996 Bytes -> Algo RING proto SIMPLE channel{0..23}
+  AllReduce:   182,095,808 Bytes -> Algo RING proto SIMPLE channel{0..23}
+  AllReduce:   268,435,456 Bytes -> Algo RING proto SIMPLE channel{0..23}
+  AllReduce:   323,817,232 Bytes -> Algo RING proto SIMPLE channel{0..23}
+  AllReduce:   575,837,516 Bytes -> Algo RING proto SIMPLE channel{0..23}
+  AllReduce: 1,023,999,996 Bytes -> Algo RING proto SIMPLE channel{0..23}
 
-  24 coll channels, 24 collnet channels, 0 nvls channels, 32 p2p channels
-  NVLS multicast support is not available on dev 0 (NVLS_NCHANNELS 0)
+  24 coll channels
+  NCCL version 2.27.3
+  NVLS multicast support is not available on dev 0..3 (NVLS_NCHANNELS 0)
 
-A decode all-reduce at batch 1 is 7,168 B, which lands in the first regime:
-the LL protocol on a SINGLE channel out of the 24 the node has. It is not using
-1/24th of the bandwidth by accident of message size alone -- it is using 1/24th
-of the fabric's parallelism by NCCL's own tuning decision, because at that size
-spreading across channels would cost more in synchronisation than it saves.
+A decode all-reduce at batch 1 is 7,168 B, which lands in the first regime: the
+LL protocol on a SINGLE channel out of the 24 this node has. The 268,435,456 B
+entry is the topology gate's 256 MB smoke test, at the other extreme.
+
+What this capture establishes, and what it does not:
+
+  OBSERVED  the algorithm is RING at every size; the protocol steps LL -> LL128 ->
+            SIMPLE as size grows; the channel count steps 1 -> 24 over the same
+            range; a decode-sized message uses exactly one channel; NVLS is
+            unavailable on every device.
+
+  INFERRED  that a one-channel LL handshake is *why* alpha does not grow with
+            world size. This capture is consistent with that and rules out the
+            competing algorithmic explanation, but it does not demonstrate the
+            causal link. The measurement that tests the mechanism directly is the
+            launch amortisation sweep (launch.py): the cost survives having every
+            host-side launch hidden behind the previous call, so it is paid on the
+            device, not in the dispatch path.
 
 NVLS is unavailable on this node, so the multicast path that would collapse the
 ring entirely was never an option here. On a node where it is available the
