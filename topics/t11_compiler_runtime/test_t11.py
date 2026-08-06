@@ -443,12 +443,34 @@ def test_lab_note_fusion_completeness_moves_the_crossover_far_more_than_length()
     """
     rows = _results()
     fusing = [v for _, v in select(rows, "crossover", "chain_fusing", "crossover_batch")][0]
-    rotary = [v for _, v in select(rows, "crossover", "chain", "crossover_batch")][0]
+    # The rotary arm of the SAME invocation, not the headline sweep -- the comparison is only
+    # clean if nothing but the fifth op differs between the two numbers.
+    paired = [v for _, v in select(rows, "crossover", "chain_paired", "crossover_batch")][0]
+    headline = [v for _, v in select(rows, "crossover", "chain", "crossover_batch")][0]
     two_op = [v for _, v in select(rows, "crossover", "chain_ops2", "crossover_batch")][0]
 
     assert fusing == pytest.approx(102, rel=0.05)
-    assert rotary / fusing > 4.0, "the note quotes a 4.6-6.5x collapse"
-    assert two_op / rotary == pytest.approx(1.16, rel=0.05), "chain length barely moved it"
+    assert paired == pytest.approx(662, rel=0.02)
+    assert paired / fusing == pytest.approx(6.5, rel=0.05), "the note quotes a 6.5x collapse"
+    assert abs(paired - headline) / headline < 0.03, "the note quotes a 2.2% run-to-run spread"
+    assert two_op / headline == pytest.approx(1.16, rel=0.05), "chain length barely moved it"
+
+
+def test_lab_note_the_paired_rotary_arm_matches_the_quoted_table() -> None:
+    """The note's rotary row quotes 1.33x at batch 1 and 2.74x at 2048 from the paired run.
+
+    These differ from the headline sweep's 1.48x and 2.72x, which is exactly why the paired arm is
+    stored separately. Quoting one run's number beside another run's is the drift this repo's
+    fact-check tests exist to catch, and it did catch it.
+    """
+    rows = _results()
+    assert _at(rows, "mechanism", "chain_paired", "fusion_speedup", 1) == pytest.approx(
+        1.33, rel=0.02
+    )
+    assert _at(rows, "mechanism", "chain_paired", "fusion_speedup", 2048) == pytest.approx(
+        2.74, rel=0.02
+    )
+    assert _at(rows, "modes", "compile_paired", "kernel_launches", 2048) == 2
 
 
 def test_lab_note_compile_emits_three_kernels_at_batch_one() -> None:

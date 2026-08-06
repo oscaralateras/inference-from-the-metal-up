@@ -149,6 +149,9 @@ moved together, and a flat crossover is consistent with either.
 rotation to the next block's post-attention RMSNorm — real, weightless, and with no `cat` for
 Inductor to give up on. Chain length is held at five and **only fusion completeness changes**:
 
+Both arms below come from the **same invocation**, so nothing between them differs but the fifth op.
+They are recorded as `*_paired` in the CSV to keep them distinct from the headline sweep:
+
 | 5-op chain | kernels after `compile` | crossover | fusion @1 | fusion @2048 |
 |---|---|---|---|---|
 | rotary (`cat` blocks fusion) | 2 | **662** | 1.33× | 2.74× |
@@ -158,10 +161,11 @@ Inductor to give up on. Chain length is held at five and **only fusion completen
 completely.** Against 1.16× for halving the chain length. Chain length was never the variable; the
 first control was measuring fusion completeness and attributing it to length.
 
-Two independent runs of the fusing chain put its crossover at **102 and 139**, against **662 and
-636** for the rotary chain in the same two runs — so the point estimate is noisy where the two
-curves run close together, but the effect is 4.6–6.5× either way and the direction is not in doubt.
-The committed rotary figure of 648 sits inside that spread, which is the reproducibility check.
+The paired rotary arm crossed at 662 against the headline sweep's **648** — a 2.2% spread across two
+rentals of the same pod, which is the reproducibility check. A second, earlier run of the same pair
+gave 636 and 139, so the fusing crossover is the noisier of the two: the interpolation lands where
+the curves run nearly parallel. **The effect is 4.6–6.5× on either run and the direction is not in
+doubt; the point estimate should not be quoted without the spread.**
 
 **This is the caveat the first write-up flagged as "the next thing I would measure", and it came back
 against the model rather than for it.** The registered band stays failed and the refutation stands —
