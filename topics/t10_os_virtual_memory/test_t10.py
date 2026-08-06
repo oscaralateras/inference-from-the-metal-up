@@ -502,3 +502,50 @@ def test_lab_note_the_real_load_is_slower_than_the_per_byte_model() -> None:
 
     assert mapped > staged_serial, "the real load must exceed the staged estimate, not undercut it"
     assert mapped / max(storage_seconds, memcpy, h2d) == pytest.approx(4.6, rel=0.1)
+
+
+def test_lab_note_the_mapped_staged_range() -> None:
+    """The note quotes 1.23-2.96 s = 111-268 tokens for a mapped stage 1.
+
+    Same three stages as the copying estimate with storage running at the measured cold mmap rate
+    instead of the copying one, floor and ceiling both.
+    """
+    rows = _results()
+    payload = [x for x, _ in select(rows, "load", "mmap_cold", "total_seconds")][0]
+    model = [x for x, _ in select(rows, "coldstart", "total", "cold_start_seconds")][0]
+    step_s = [v for _, v in select(rows, "coldstart", "total", "cold_start_seconds")][0] / [
+        v for _, v in select(rows, "coldstart", "total", "tokens_foregone")
+    ][0]
+
+    mapped_gbps = payload / _load(rows, "mmap_cold", "total_seconds") / 1e9
+    storage = model / (mapped_gbps * 1e9)
+    memcpy = [v for _, v in select(rows, "coldstart", "host_memcpy", "stage_seconds")][0]
+    h2d = [v for _, v in select(rows, "coldstart", "h2d_pinned", "stage_seconds")][0]
+
+    assert max(storage, memcpy, h2d) == pytest.approx(1.23, rel=0.02)
+    assert storage + memcpy + h2d == pytest.approx(2.96, rel=0.02)
+    assert max(storage, memcpy, h2d) / step_s == pytest.approx(111, rel=0.02)
+    assert (storage + memcpy + h2d) / step_s == pytest.approx(268, rel=0.02)
+
+
+def test_lab_note_the_storage_speeds_at_which_the_failed_bands_would_pass() -> None:
+    """The note's portability table: band 3 needs storage <= 1.25 GB/s, band 4 <= 3.13.
+
+    Both fall out of the two-stage model. `read` is capped by the copy however fast storage gets,
+    so mmap/read = 1 + storage/copy and cold/warm = 1 + copy/storage. Solving each against its
+    registered threshold is what turns "on a slower disk it would pass" into a number.
+    """
+    from topics.t10_os_virtual_memory.predict import MAX_MMAP_TRUE_SPEEDUP, MIN_COLD_WARM_RATIO
+
+    rows = _results()
+    copy_gbps = _load(rows, "read_warm", "load_gbps")
+    payload = [x for x, _ in select(rows, "load", "mmap_cold", "total_seconds")][0]
+    storage_gbps = payload / _load(rows, "mmap_cold", "total_seconds") / 1e9
+
+    band3_max = (MAX_MMAP_TRUE_SPEEDUP - 1) * copy_gbps
+    band4_max = copy_gbps / (MIN_COLD_WARM_RATIO - 1)
+
+    assert band3_max == pytest.approx(1.25, rel=0.01)
+    assert band4_max == pytest.approx(3.13, rel=0.01)
+    assert storage_gbps == pytest.approx(12.38, rel=0.01)
+    assert storage_gbps > band4_max > band3_max, "this box is past both thresholds"
