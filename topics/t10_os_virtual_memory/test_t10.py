@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from arch_common.results_io import read_rows, select
 from topics.t10_os_virtual_memory.h2d import series_gbps
 from topics.t10_os_virtual_memory.loaders import (
     LOADERS,
@@ -310,3 +311,142 @@ def test_mmap_defers_far_more_than_read_does(weight_file: Path) -> None:
     """
     mapped, copied = load_via_mmap(weight_file), load_via_read(weight_file)
     assert mapped.faults_per_page > 10 * copied.faults_per_page
+
+
+# ---------------------------------------------------------------------------------------------
+# The lab note, checked against the data it claims to describe
+# ---------------------------------------------------------------------------------------------
+#
+# T5 learned this the hard way: its note and its CSV disagreed until a test compared them. A number
+# in prose is a copy of a number in a file, and copies drift.
+
+
+def _results() -> list[dict[str, str]]:
+    from topics.t10_os_virtual_memory.measure import CSV_PATH
+
+    if not CSV_PATH.exists():
+        pytest.skip("T10 has not been run in this session")
+    rows = read_rows(CSV_PATH)
+    if {r["session_id"] for r in rows} == {"rehearsal"}:
+        pytest.skip("T10 holds rehearsal numbers, not measured ones")
+    return rows
+
+
+def _load(rows: list[dict[str, str]], variant: str, metric: str) -> float:
+    hits = [v for _, v in select(rows, "load", variant, metric)]
+    assert len(hits) == 1, f"expected one load/{variant}/{metric} row, found {len(hits)}"
+    return hits[0]
+
+
+def _h2d(rows: list[dict[str, str]], metric: str, nbytes: int) -> float:
+    hits = [v for x, v in select(rows, "h2d", "transfer", metric) if int(x) == nbytes]
+    assert len(hits) == 1, f"expected one h2d/{metric} row at {nbytes}"
+    return hits[0]
+
+
+# (variant, load seconds, first touch seconds, total seconds) — the note's headline table.
+QUOTED_LOADERS = [
+    ("mmap_cold", 0.0001, 0.694, 0.694),
+    ("mmap_warm", 0.0001, 0.120, 0.120),
+    ("read_cold", 2.415, 0.208, 2.623),
+    ("read_warm", 1.374, 0.199, 1.573),
+]
+
+
+@pytest.mark.parametrize(("variant", "load_s", "touch_s", "total_s"), QUOTED_LOADERS)
+def test_lab_note_loader_table(variant: str, load_s: float, touch_s: float, total_s: float) -> None:
+    rows = _results()
+    measured_load = _load(rows, variant, "load_seconds")
+    if variant.startswith("mmap"):
+        # mmap's load call is sub-millisecond because it moves nothing, so a relative tolerance on
+        # it would be comparing noise to noise. The claim the note makes is that it rounds to zero.
+        assert measured_load == pytest.approx(load_s, abs=0.0002)
+    else:
+        assert measured_load == pytest.approx(load_s, rel=0.01)
+    assert _load(rows, variant, "first_touch_seconds") == pytest.approx(touch_s, rel=0.01)
+    assert _load(rows, variant, "total_seconds") == pytest.approx(total_s, rel=0.01)
+
+
+def test_lab_note_band_verdicts_are_reported_correctly() -> None:
+    """Four of six outside. A note quietly reporting more passes than it earned fails here."""
+    rows = _results()
+    from topics.t10_os_virtual_memory.predict import (
+        MAX_MMAP_TRUE_SPEEDUP,
+        MIN_COLD_WARM_RATIO,
+        MIN_MMAP_APPARENT_SPEEDUP,
+        MIN_PINNED_SPEEDUP,
+        MIN_SHARE_OF_STAGE_CEILING,
+    )
+
+    head = 256 * 1024**2
+
+    # (1) OUTSIDE — the runtime overlaps the staging copy with the DMA.
+    assert _h2d(rows, "pinned_over_pageable", head) < MIN_PINNED_SPEEDUP
+    # (2) WITHIN, enormously.
+    apparent = _load(rows, "read_warm", "load_seconds") / _load(rows, "mmap_warm", "load_seconds")
+    assert apparent >= MIN_MMAP_APPARENT_SPEEDUP
+    # (3) OUTSIDE — mmap wins cold too, because it is zero-copy rather than merely lazy.
+    cold = _load(rows, "read_cold", "total_seconds") / _load(rows, "mmap_cold", "total_seconds")
+    assert cold > MAX_MMAP_TRUE_SPEEDUP
+    # (4) OUTSIDE — the storage is fast, so warm is only modestly ahead.
+    warm_ratio = _load(rows, "read_cold", "load_seconds") / _load(rows, "read_warm", "load_seconds")
+    assert warm_ratio < MIN_COLD_WARM_RATIO
+    # (5) read path OUTSIDE, pinned H2D WITHIN.
+    read_share = _load(rows, "read_warm", "load_gbps") / _h2d(rows, "memcpy_gbps", head)
+    assert read_share < MIN_SHARE_OF_STAGE_CEILING
+    asymptote = max(v for _, v in select(rows, "h2d", "transfer", "pinned_gbps"))
+    assert _h2d(rows, "pinned_gbps", head) / asymptote >= MIN_SHARE_OF_STAGE_CEILING
+
+
+def test_lab_note_mmap_beats_read_cold_by_the_quoted_factor() -> None:
+    """The note quotes 3.78x cold and 13.1x warm."""
+    rows = _results()
+    cold = _load(rows, "read_cold", "total_seconds") / _load(rows, "mmap_cold", "total_seconds")
+    warm = _load(rows, "read_warm", "total_seconds") / _load(rows, "mmap_warm", "total_seconds")
+    assert cold == pytest.approx(3.78, rel=0.01)
+    assert warm == pytest.approx(13.1, rel=0.02)
+
+
+def test_lab_note_the_two_stage_account_of_the_copying_loader() -> None:
+    """The note's central mechanism claim, checked as arithmetic.
+
+    mmap cold measures the storage on its own; warm read measures the copy on its own. Composed in
+    series they must reproduce cold read — that is what says the copying loader is disk-then-copy
+    and the mapped one is disk alone.
+    """
+    from topics.t10_os_virtual_memory.h2d import series_gbps
+
+    rows = _results()
+    nbytes = 8 * 1024**3
+    storage = nbytes / _load(rows, "mmap_cold", "first_touch_seconds") / 1e9
+    copy = _load(rows, "read_warm", "load_gbps")
+
+    assert storage == pytest.approx(12.4, rel=0.02)
+    assert copy == pytest.approx(6.25, rel=0.01)
+    assert series_gbps(storage, copy) == pytest.approx(
+        _load(rows, "read_cold", "load_gbps"), rel=0.20
+    )
+
+
+def test_lab_note_pageable_beats_the_serial_two_copy_bound() -> None:
+    """The note quotes 2.15x above the serial bound, i.e. the staging copy is pipelined."""
+    rows = _results()
+    head = 256 * 1024**2
+    assert _h2d(rows, "pageable_gbps", head) / _h2d(rows, "serial_bound_gbps", head) == (
+        pytest.approx(2.15, rel=0.02)
+    )
+
+
+def test_lab_note_cold_start_in_tokens() -> None:
+    """The note quotes 6.02 s and 545 tokens, and the stages must sum to the total."""
+    rows = _results()
+    total = [v for _, v in select(rows, "coldstart", "total", "cold_start_seconds")][0]
+    tokens = [v for _, v in select(rows, "coldstart", "total", "tokens_foregone")][0]
+    stages = sum(
+        [v for _, v in select(rows, "coldstart", name, "stage_seconds")][0]
+        for name in ("storage_read", "host_memcpy", "h2d_pinned")
+    )
+
+    assert total == pytest.approx(6.02, rel=0.01)
+    assert tokens == pytest.approx(545, rel=0.01)
+    assert stages == pytest.approx(total, rel=0.001), "the stage times must add up to the total"
