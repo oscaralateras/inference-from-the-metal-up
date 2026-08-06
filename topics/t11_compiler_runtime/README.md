@@ -67,6 +67,42 @@ number it was given did not.
 (Per *kernel* rather than per chain op it is 10.5 µs, because eager runs 11 kernels for a 5-op
 chain — see below, that discrepancy matters.)
 
+## How much of batch 648 is the framework rather than the machine
+
+Enough that the honest headline is a range, and this is the sharpest limitation on the number above.
+
+The registered crossover compares `eager/compile` against `eager/graph`. The `compile` column pays
+Dynamo's guard and dispatch cost on every call and the `graph` column does not — and that cost is
+nearly constant across the whole sweep (`compile` runs 95.4 µs at batch 1 and 91.7 µs at batch 2048,
+for 2,048× the work). It is a **host** cost, on a container that reported 255 CPUs while cgroup-
+limited to 16. It penalises fusion at every batch and therefore pushes the crossover later.
+
+Comparing the two graph-captured columns instead — `graph` (unfused) against `compile_graph`
+(fused) — measures the same fusion with that cost removed from both sides:
+
+| batch | fusion, as registered | fusion, host cost removed | capture |
+|---|---|---|---|
+| 1 | 1.48× | **2.99×** | 5.50× |
+| 8 | 1.88× | **4.02×** | 5.01× |
+| 32 | 1.85× | **4.95×** | 3.91× |
+| 128 | 1.85× | **5.43×** | 3.50× |
+| 512 | 1.84× | **5.48×** | 2.18× |
+| 2048 | 2.72× | **4.41×** | 1.07× |
+
+Run the repo's own log2 interpolation over the last two columns and the crossover falls from **648
+to 15.8** — a factor of **41**.
+
+**The registered band stands as it was scored**; this is reported beside it, not in place of it, and
+nothing is rescored. But it changes what the headline means. The device-side mechanisms swap over
+very early — by batch ~16 fusion is already the larger win. What sits at 648 is the batch at which
+fusion overtakes capture *once fusion is also paying ~90 µs per call to the Python-side compiler
+stack*. Both are real numbers a practitioner meets; they answer different questions.
+
+The one to quote depends on which you are asking. **"Which mechanism should I reach for at batch
+32?"** — capture, if you are calling `torch.compile` in the hot path on a CPU like this one; fusion,
+if the guard cost is amortised or the host is faster. That the two answers differ by 41× in
+crossover is the finding, and it is a much better warning than a single batch number would have been.
+
 ## The control refuted the chain-length prediction, and that is the most useful result here
 
 The model says fusion removes `2k−3` round trips while capture removes `k` launches, so a shorter
@@ -101,6 +137,37 @@ model**, and the note is not going to claim it was.
 
 What survives is empirical and still useful: **the crossover sits at 630–750 and is insensitive to
 chain length over 2–5 ops.**
+
+### The second control: it was never chain length, it was fusion completeness
+
+The control above cannot actually separate two explanations, and the first write-up said so as a
+caveat rather than resolving it. The 2- and 3-op chains fuse to **one** kernel; the 5-op chain fuses
+to **two**, because the rotary `cat` materialises. So "longer chain" and "less completely fused"
+moved together, and a flat crossover is consistent with either.
+
+`make t11-fusing` separates them. Same five ops, same byte model, fifth op swapped from the rotary
+rotation to the next block's post-attention RMSNorm — real, weightless, and with no `cat` for
+Inductor to give up on. Chain length is held at five and **only fusion completeness changes**:
+
+| 5-op chain | kernels after `compile` | crossover | fusion @1 | fusion @2048 |
+|---|---|---|---|---|
+| rotary (`cat` blocks fusion) | 2 | **662** | 1.33× | 2.74× |
+| all-fusing (post-norm) | **1** | **102** | **3.52×** | **4.90×** |
+
+**The crossover collapses by 6.5× when the only thing that changes is whether the chain fuses
+completely.** Against 1.16× for halving the chain length. Chain length was never the variable; the
+first control was measuring fusion completeness and attributing it to length.
+
+Two independent runs of the fusing chain put its crossover at **102 and 139**, against **662 and
+636** for the rotary chain in the same two runs — so the point estimate is noisy where the two
+curves run close together, but the effect is 4.6–6.5× either way and the direction is not in doubt.
+The committed rotary figure of 648 sits inside that spread, which is the reproducibility check.
+
+**This is the caveat the first write-up flagged as "the next thing I would measure", and it came back
+against the model rather than for it.** The registered band stays failed and the refutation stands —
+what changes is the diagnosis. The model's error was not the `2k−3` traffic term being wrong in
+principle; it was that the term assumes complete fusion, and the chain it was scored on did not
+deliver it.
 
 ## Band 4: the chain does not fully fuse, and the kernel counts prove it
 
@@ -138,8 +205,9 @@ Measured **1.48×**.
 
 The arithmetic was right and the model was incomplete. Fusion does not only remove HBM round trips;
 it removes **kernels**, and each kernel eager-dispatched costs Python and dispatch time on the host.
-Eager runs **11** kernels for this chain and `compile` runs **2**. At batch 1, that is the whole
-effect — the byte model predicted only the part of fusion that is about bytes.
+Eager runs **11** kernels for this chain and `compile` runs **3 at batch 1** and 2 at every larger
+batch — Inductor picks a slightly different schedule for the smallest case. At batch 1 that kernel
+removal is the whole effect: the byte model predicted only the part of fusion that is about bytes.
 
 This also explains part of why band 3's chain-length prediction failed: the model's `ops` (5) and
 the real kernel count (11) are not the same number, and they do not scale together.
@@ -153,8 +221,10 @@ The practical shape is regime-dependent, which was the hypothesis and is what th
 - **High-batch, throughput serving** → **fuse**. Past batch ~650 capture is worth almost nothing
   (1.07× at 2048) while fusion is worth 2.7×.
 - **Do both** — 16–20× across the low and middle batches, more than either alone everywhere.
-- **Check that your chain actually fused.** A single non-fusing op in the middle costs half the
-  achievable bandwidth, and nothing warns you. The kernel count does.
+- **Check that your chain actually fused** — this turned out to be the largest effect in the topic.
+  A single non-fusing op costs half the achievable bandwidth *and* moves the batch at which fusion
+  becomes the right lever by **6.5×**. Nothing warns you; the kernel count does. `chunk`/`cat` is
+  the op that broke it here, and it is everywhere in rotary embedding implementations.
 
 It also closes a thread T9 opened deliberately: T9 measured a *collective's* fixed per-call cost at
 ~34 µs and noted plain kernel launches were the same phenomenon, untested. Measured here at
@@ -201,11 +271,18 @@ in sequence and never pays for one in isolation.
   faster host CPU the fusion column would look better and the crossover would move. The container
   reported 255 CPUs while being limited to 16, which will not have helped.
 - **The crossover is a property of this hardware pairing**, not a universal batch size. It is where
-  a ~90 µs host-side cost meets a rising traffic cost; both terms are machine-specific.
-- **Chain lengths 2, 3 and 5 only.** The refutation of the length-scaling prediction rests on three
-  points, and the two shorter chains both fuse to one kernel while the longest does not — so chain
-  length and fusion completeness are confounded in this data. Separating them needs a 5-op chain
-  whose ops all fuse, which is the next thing I would measure.
+  a ~90 µs host-side cost meets a rising traffic cost; both terms are machine-specific. "How much of
+  batch 648 is the framework" above quantifies it: remove the host cost and the same data crosses at
+  **15.8**. Treat 648 as this pod's answer, not the mechanism's.
+- **The chain-length confound is resolved, but not by holding everything else equal.** The
+  all-fusing chain matches the rotary one on op count and byte model, and it fuses to one kernel —
+  but it runs **15** eager kernels to the rotary chain's 11, because a second RMSNorm decomposes
+  into more primitives than a `chunk` and a `cat`. So its eager baseline is slower and both its
+  speedup columns are flattered. The crossover comparison is a ratio of ratios and survives that;
+  the absolute speedups in the all-fusing row should not be read against the rotary row directly.
+- **The all-fusing crossover is noisy.** 102 and 139 across two runs, because the interpolation
+  lands where the two curves are nearly parallel. Quote the effect (4.6–6.5×), not the point.
+- **Chain lengths 2, 3 and 5 only**, and one op swap at length 5.
 - **One chain shape, one dtype, one hidden size.**
 - **Inductor's default mode only.** `max-autotune` was not tried; it would change the fusion column
   and not the graph one.
@@ -233,6 +310,7 @@ one pod and one hardware probe with T10:
 bash s.sh setup     # clone + uv sync + make probe
 bash s.sh t11       # the 2x2 across the batch sweep, then the crossover
 bash s.sh control   # band 3's falsification run at shorter chain lengths
+make t11-fusing     # the second control: same 5 ops, fifth one actually fuses
 ```
 
 Every number quoted here is asserted against `results/compiler.csv` by the `test_lab_note_*` tests

@@ -1,6 +1,6 @@
 .PHONY: setup lint format format-check type test ci probe t6 t7 t8 t8-predict t8-ceiling \
         t9 t9-predict t9-tp t9-rehearse t9-launch t9-launch-graphs t9-vllm \
-        t10 t10-predict t10-rehearse t11 t11-predict t11-rehearse t11-control
+        t10 t10-predict t10-rehearse t11 t11-predict t11-rehearse t11-control t11-fusing
 
 # GPU topics. Run `make probe` once per pod first — T6, T7 and T8 all read their ceilings from the
 # hardware profile it writes, and a cross-topic test asserts they came from the same session.
@@ -98,6 +98,9 @@ t11:
 	uv run python -m topics.t11_compiler_runtime.measure
 	uv run python -m topics.t11_compiler_runtime.plot
 t11-control: ; uv run python -m topics.t11_compiler_runtime.measure --chain-lengths 2,3
+# The second control: holds chain length at 5 and changes only whether the chain fuses completely,
+# which is what `t11-control` alone cannot separate.
+t11-fusing: ; uv run python -m topics.t11_compiler_runtime.measure --all-fusing
 
 setup: ; uv sync
 lint: ; uv run ruff check .

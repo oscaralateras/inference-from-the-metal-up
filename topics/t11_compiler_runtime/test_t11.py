@@ -400,3 +400,60 @@ def test_lab_note_compile_is_host_bound() -> None:
     assert _at(rows, "modes", "compile", "latency_us", 2048) <= _at(
         rows, "modes", "compile", "latency_us", 1
     )
+
+
+BATCH_SWEEP = (1, 8, 32, 128, 512, 2048)
+
+
+def test_lab_note_removing_the_host_cost_collapses_the_crossover() -> None:
+    """The note reports a registered crossover of 648 and a host-free one of 15.8.
+
+    `compile` pays Dynamo's guard cost on every call and `graph` does not, so the registered
+    comparison charges fusion for something that is not fusion. Comparing the two graph-captured
+    columns removes it from both sides. If that ever stopped mattering, the note's central caveat
+    about batch 648 would be overstated and this test should fail.
+    """
+    rows = _results()
+    batches: list[int] = list(BATCH_SWEEP)
+    capture = [_at(rows, "modes", "eager", "latency_us", b) for b in batches]
+    unfused = [_at(rows, "modes", "graph", "latency_us", b) for b in batches]
+    fused = [_at(rows, "modes", "compile_graph", "latency_us", b) for b in batches]
+    registered = [_at(rows, "mechanism", "chain", "fusion_speedup", b) for b in batches]
+
+    graphs = [c / u for c, u in zip(capture, unfused, strict=True)]
+    host_free = [u / f for u, f in zip(unfused, fused, strict=True)]
+
+    assert crossover_batch(batches, registered, graphs) == pytest.approx(648, rel=0.02)
+    assert crossover_batch(batches, host_free, graphs) == pytest.approx(15.8, rel=0.05)
+
+
+def test_lab_note_the_all_fusing_chain_reaches_one_kernel() -> None:
+    """The whole second control rests on this: five ops, one kernel, at every batch."""
+    rows = _results()
+    for batch in BATCH_SWEEP:
+        assert _at(rows, "modes", "compile_fusing", "kernel_launches", batch) == 1
+        assert _at(rows, "modes", "eager_fusing", "kernel_launches", batch) == 15
+
+
+def test_lab_note_fusion_completeness_moves_the_crossover_far_more_than_length() -> None:
+    """The note's claim: 6.5x from fusion completeness against 1.16x from halving the chain.
+
+    The rotary and all-fusing chains have the same op count and the same byte model, so the only
+    thing separating their crossovers is whether the chain collapses to one kernel.
+    """
+    rows = _results()
+    fusing = [v for _, v in select(rows, "crossover", "chain_fusing", "crossover_batch")][0]
+    rotary = [v for _, v in select(rows, "crossover", "chain", "crossover_batch")][0]
+    two_op = [v for _, v in select(rows, "crossover", "chain_ops2", "crossover_batch")][0]
+
+    assert fusing == pytest.approx(102, rel=0.05)
+    assert rotary / fusing > 4.0, "the note quotes a 4.6-6.5x collapse"
+    assert two_op / rotary == pytest.approx(1.16, rel=0.05), "chain length barely moved it"
+
+
+def test_lab_note_compile_emits_three_kernels_at_batch_one() -> None:
+    """The note used to say `compile` runs 2 kernels. At batch 1 Inductor emits 3."""
+    rows = _results()
+    assert _at(rows, "modes", "compile", "kernel_launches", 1) == 3
+    assert _at(rows, "modes", "compile", "kernel_launches", 2048) == 2
+    assert _at(rows, "modes", "eager", "kernel_launches", 1) == 11
