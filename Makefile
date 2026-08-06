@@ -1,5 +1,6 @@
 .PHONY: setup lint format format-check type test ci probe t6 t7 t8 t8-predict t8-ceiling \
-        t9 t9-predict t9-tp t9-rehearse t9-launch t9-launch-graphs t9-vllm
+        t9 t9-predict t9-tp t9-rehearse t9-launch t9-launch-graphs t9-vllm \
+        t10 t10-predict t10-rehearse
 
 # GPU topics. Run `make probe` once per pod first — T6, T7 and T8 all read their ceilings from the
 # hardware profile it writes, and a cross-topic test asserts they came from the same session.
@@ -68,6 +69,22 @@ t9-launch: ; uv run python -m topics.t09_interconnects.launch --world-sizes 2,4
 # session once already, and the amortisation sweep answers the question without it.
 t9-launch-graphs: ; uv run python -m topics.t09_interconnects.launch --world-sizes 2,4 --graphs
 t9-vllm: ; uv run python -m topics.t09_interconnects.vllm_tp --tp 1,2,4
+
+# T10 — cold start. Needs a GPU for stages 3-4 and **root** for the cache drops, which is the one
+# requirement that cannot be worked around: a "cold" read on a warm page cache is a DRAM memcpy
+# wearing a disk's name, and it is the single most common way a model-load benchmark produces a
+# number that will not reproduce on a fresh pod.
+#
+#   1. t10-predict    files the bands. Laptop, no GPU, no root.
+#   2. t10-rehearse   the same harness on a small file, warm only, no GPU. Numbers not published.
+#   3. t10            the session: cold and warm x read and mmap, then H2D, then the bands.
+t10-predict: ; uv run python -m topics.t10_os_virtual_memory.predict --write
+t10-rehearse:
+	uv run python -m topics.t10_os_virtual_memory.measure --gib 0.5 --no-cold --no-gpu \
+	    --path /tmp/t10_rehearsal.bin
+t10:
+	uv run python -m topics.t10_os_virtual_memory.measure --gib 8
+	uv run python -m topics.t10_os_virtual_memory.plot
 
 setup: ; uv sync
 lint: ; uv run ruff check .
